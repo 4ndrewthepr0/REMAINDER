@@ -1,0 +1,1 @@
+DATABASE -> SQLite WAL mode enabled with foreign_keys=ON and auto-checkpointing for zero corruption.
