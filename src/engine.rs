@@ -167,7 +167,8 @@ impl RemainderEngine {
         Ok(())
     }
 
-    /// Retrieves all historical facts recorded under a category tag
+    /// Retrieves up to `limit` (default 50) current facts recorded under a category tag.
+    /// Note: source refreshes replace prior facts for that source to maintain clean provenance.
     pub fn get_facts_by_tag(&self, tag: &str, limit: Option<usize>) -> anyhow::Result<Vec<String>> {
         let limit_val = limit.unwrap_or(50) as i64;
         let mut stmt = self.conn.prepare(

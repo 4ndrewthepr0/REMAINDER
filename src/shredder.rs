@@ -5,13 +5,19 @@ use serde_json::json;
 pub struct Shredder {
     client: Client,
     model: String,
+    base_url: String,
 }
 
 impl Shredder {
     pub fn new(model: &str) -> Self {
+        Self::with_base_url(model, "http://localhost:11434")
+    }
+
+    pub fn with_base_url(model: &str, base_url: &str) -> Self {
         Self {
             client: Client::new(),
             model: model.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -26,7 +32,8 @@ impl Shredder {
             input
         );
 
-        let resp = self.client.post("http://localhost:11434/api/generate")
+        let url = format!("{}/api/generate", self.base_url);
+        let resp = self.client.post(&url)
             .json(&json!({
                 "model": self.model,
                 "prompt": prompt,
