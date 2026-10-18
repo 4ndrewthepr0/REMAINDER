@@ -15,12 +15,13 @@ impl Shredder {
         }
     }
 
-    /// Takes raw text and returns a distilled 'Atomic Fact' via Local LLM
+    /// Takes raw text and extracts all distilled 'Atomic Facts' via Local LLM
     pub async fn extract_atomic(&self, input: &str) -> anyhow::Result<String> {
         let prompt = format!(
             "### Instruction: \
-            Distill the following input into a single, dense technical fact or decision. \
-            Format: [CATEGORY_TAG] -> DATA. No conversational fluff, no explanations. \
+            Analyze the following input and extract all distinct technical facts, architectural decisions, and operational constraints. \
+            Output each fact on its own line in the exact format: [CATEGORY_TAG] -> FACT_OR_DECISION. \
+            Do not condense multiple distinct decisions into a single line. No preamble, no conversational fluff, no bullet numbers. \
             \nInput: {}\n\n### Response:", 
             input
         );

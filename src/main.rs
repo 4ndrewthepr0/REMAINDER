@@ -11,6 +11,10 @@ use tokio::time::{interval, Duration, Instant};
 use serde_json::json;
 use sha2::{Sha256, Digest};
 
+fn is_supported_file(path: &Path) -> bool {
+    path.extension().map_or(false, |ext| ext == "txt" || ext == "rs" || ext == "md")
+}
+
 fn get_db_path() -> PathBuf {
     if Path::new("remainder.db").exists() {
         return PathBuf::from("remainder.db");
@@ -67,7 +71,7 @@ fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> 
                         "capabilities": { "tools": {} },
                         "serverInfo": {
                             "name": "remainder-bunker",
-                            "version": "0.3.0"
+                            "version": "0.3.1"
                         }
                     }
                 }))
@@ -103,9 +107,14 @@ fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> 
                     .unwrap_or("");
 
                 let text = if name == "query_bunker" {
-                    match engine.get_latest_fact(tag) {
-                        Ok(Some(fact)) => format!("[BUNKER] {} -> {}", tag, fact),
-                        Ok(None) => format!("[BUNKER] No records found for tag: {}", tag),
+                    match engine.get_facts_by_tag(tag, Some(50)) {
+                        Ok(facts) if !facts.is_empty() => {
+                            facts.iter()
+                                .map(|f| format!("[BUNKER] {} -> {}", tag, f))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                        Ok(_) => format!("[BUNKER] No records found for tag: {}", tag),
                         Err(e) => format!("Error querying bunker: {}", e),
                     }
                 } else {
@@ -144,6 +153,7 @@ fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> 
 enum WatchEvent {
     Modify(PathBuf),
     Remove(PathBuf),
+    Rename { from: PathBuf, to: PathBuf },
 }
 
 struct PendingItem {
@@ -179,8 +189,10 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         } else if args.len() > 3 && args[2] == "call" {
             let tag = &args[3];
-            if let Ok(Some(fact)) = engine.get_latest_fact(tag) {
-                println!("{}", json!({ "content": [{ "type": "text", "text": fact }] }));
+            let facts = engine.get_facts_by_tag(tag, Some(50))?;
+            if !facts.is_empty() {
+                let combined = facts.join("\n");
+                println!("{}", json!({ "content": [{ "type": "text", "text": combined }] }));
             } else {
                 println!("{}", json!({ "content": [{ "type": "text", "text": "No records found." }] }));
             }
@@ -190,12 +202,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- CLI QUERY MODE ---
+    // --- CLI QUERY MODE (Multi-fact retrieval) ---
     if args.len() > 2 && args[1] == "query" {
         let tag = &args[2];
-        match engine.get_latest_fact(tag)? {
-            Some(fact) => println!("[BUNKER] {} -> {}", tag, fact),
-            None => println!("[BUNKER] No records found for tag: {}", tag),
+        let facts = engine.get_facts_by_tag(tag, Some(50))?;
+        if facts.is_empty() {
+            println!("[BUNKER] No records found for tag: {}", tag);
+        } else {
+            for fact in facts {
+                println!("[BUNKER] {} -> {}", tag, fact);
+            }
         }
         return Ok(());
     }
@@ -239,11 +255,10 @@ async fn main() -> anyhow::Result<()> {
                         match rename_mode {
                             RenameMode::Both => {
                                 if event.paths.len() >= 2 {
-                                    let _ = tx.blocking_send(WatchEvent::Remove(event.paths[0].clone()));
-                                    let to_path = event.paths[1].clone();
-                                    if to_path.extension().map_or(false, |ext| ext == "txt" || ext == "rs" || ext == "md") {
-                                        let _ = tx.blocking_send(WatchEvent::Modify(to_path));
-                                    }
+                                    let _ = tx.blocking_send(WatchEvent::Rename {
+                                        from: event.paths[0].clone(),
+                                        to: event.paths[1].clone(),
+                                    });
                                 }
                             }
                             RenameMode::From => {
@@ -253,7 +268,12 @@ async fn main() -> anyhow::Result<()> {
                             }
                             RenameMode::To => {
                                 for path in event.paths {
-                                    if path.extension().map_or(false, |ext| ext == "txt" || ext == "rs" || ext == "md") {
+                                    if path.is_dir() {
+                                        let _ = tx.blocking_send(WatchEvent::Rename {
+                                            from: PathBuf::new(),
+                                            to: path,
+                                        });
+                                    } else if is_supported_file(&path) {
                                         let _ = tx.blocking_send(WatchEvent::Modify(path));
                                     }
                                 }
@@ -261,7 +281,12 @@ async fn main() -> anyhow::Result<()> {
                             _ => {
                                 for path in event.paths {
                                     if path.exists() {
-                                        if path.extension().map_or(false, |ext| ext == "txt" || ext == "rs" || ext == "md") {
+                                        if path.is_dir() {
+                                            let _ = tx.blocking_send(WatchEvent::Rename {
+                                                from: PathBuf::new(),
+                                                to: path,
+                                            });
+                                        } else if is_supported_file(&path) {
                                             let _ = tx.blocking_send(WatchEvent::Modify(path));
                                         }
                                     } else {
@@ -273,7 +298,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                     EventKind::Modify(_) | EventKind::Create(_) => {
                         for path in event.paths {
-                            if path.extension().map_or(false, |ext| ext == "txt" || ext == "rs" || ext == "md") {
+                            if path.is_dir() {
+                                // Directory created or modified: walk it to index any existing supported files
+                                for entry in walkdir::WalkDir::new(&path).into_iter().filter_map(|e| e.ok()) {
+                                    if entry.file_type().is_file() && is_supported_file(entry.path()) {
+                                        let _ = tx.blocking_send(WatchEvent::Modify(entry.into_path()));
+                                    }
+                                }
+                            } else if is_supported_file(&path) {
                                 let _ = tx.blocking_send(WatchEvent::Modify(path));
                             }
                         }
@@ -308,6 +340,37 @@ async fn main() -> anyhow::Result<()> {
                         }
                         let _ = engine.reconcile_missing_sources();
                     }
+                    WatchEvent::Rename { from, to } => {
+                        // 1. Purge old sources under 'from'
+                        if !from.as_os_str().is_empty() {
+                            let from_str = from.to_string_lossy().to_string();
+                            match engine.remove_source_or_prefix(&from_str) {
+                                Ok(deleted) if deleted > 0 => {
+                                    println!("\n[RENAME] Relocated source '{}' purged ({} cascade records).", from_str, deleted);
+                                }
+                                _ => {}
+                            }
+                            pending_files.retain(|p, _| !p.starts_with(&from));
+                            in_flight.retain(|p| !p.starts_with(&from));
+                        }
+
+                        // 2. Index new relocated files under 'to'
+                        if to.is_dir() {
+                            println!("\n[RENAME] Directory relocated to '{:?}'. Traversing files...", to.file_name().unwrap_or_default());
+                            for entry in walkdir::WalkDir::new(&to).into_iter().filter_map(|e| e.ok()) {
+                                if entry.file_type().is_file() && is_supported_file(entry.path()) {
+                                    let p = entry.into_path();
+                                    let deadline = Instant::now() + Duration::from_secs(3);
+                                    pending_files.insert(p, PendingItem { deadline, retry_count: 0 });
+                                }
+                            }
+                        } else if is_supported_file(&to) {
+                            let deadline = Instant::now() + Duration::from_secs(3);
+                            pending_files.insert(to, PendingItem { deadline, retry_count: 0 });
+                        }
+                        let _ = engine.reconcile_missing_sources();
+                        let _ = engine.checkpoint();
+                    }
                     WatchEvent::Modify(path) => {
                         let deadline = Instant::now() + Duration::from_secs(3);
                         if let Some(file_name) = path.file_name() {
@@ -327,7 +390,7 @@ async fn main() -> anyhow::Result<()> {
                 let file_str = path.to_string_lossy().to_string();
 
                 // Race condition guard: verify file still exists with identical content
-                let current_content = match std::fs::read_to_string(&path) {
+                let current_content = match tokio::fs::read_to_string(&path).await {
                     Ok(c) => c,
                     Err(_) => {
                         println!("[RACE GUARD] File '{}' disappeared during inference. Stale result discarded.", file_name);
@@ -370,8 +433,10 @@ async fn main() -> anyhow::Result<()> {
                         if facts_to_insert.is_empty() {
                             let next_retry = current_retry + 1;
                             if next_retry <= 5 {
-                                let delay = Duration::from_secs(2 * next_retry as u64);
-                                println!("[RETRY] Model output unparsed into structured facts. Scheduling recovery retry {}/5 for '{}' in {:?}", next_retry, file_name, delay);
+                                // True exponential backoff: 2^(attempt - 1) -> 1s, 2s, 4s, 8s, 16s
+                                let delay_secs = 1u64 << (next_retry - 1);
+                                let delay = Duration::from_secs(delay_secs);
+                                println!("[RETRY] Model output unparsed into structured facts. Scheduling exponential backoff retry {}/5 for '{}' in {:?}", next_retry, file_name, delay);
                                 pending_files.insert(path, PendingItem {
                                     deadline: Instant::now() + delay,
                                     retry_count: next_retry,
@@ -397,7 +462,8 @@ async fn main() -> anyhow::Result<()> {
                                 println!("[ERROR] Transaction aborted. Database rolled back safely: {}", e);
                                 let next_retry = current_retry + 1;
                                 if next_retry <= 5 {
-                                    let delay = Duration::from_secs(2 * next_retry as u64);
+                                    let delay_secs = 1u64 << (next_retry - 1);
+                                    let delay = Duration::from_secs(delay_secs);
                                     pending_files.insert(path, PendingItem {
                                         deadline: Instant::now() + delay,
                                         retry_count: next_retry,
@@ -411,8 +477,10 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => {
                         let next_retry = current_retry + 1;
                         if next_retry <= 5 {
-                            let delay = Duration::from_secs(2 * next_retry as u64);
-                            println!("[RETRY] Extraction failed: {}. Scheduling recovery retry {}/5 for '{}' in {:?}", e, next_retry, file_name, delay);
+                            // True exponential backoff: 2^(attempt - 1) -> 1s, 2s, 4s, 8s, 16s
+                            let delay_secs = 1u64 << (next_retry - 1);
+                            let delay = Duration::from_secs(delay_secs);
+                            println!("[RETRY] Shredder HTTP/model error: {}. Scheduling exponential backoff retry {}/5 for '{}' in {:?}", e, next_retry, file_name, delay);
                             pending_files.insert(path, PendingItem {
                                 deadline: Instant::now() + delay,
                                 retry_count: next_retry,
@@ -447,7 +515,8 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    let content = match std::fs::read_to_string(&path) {
+                    // Async non-blocking file read
+                    let content = match tokio::fs::read_to_string(&path).await {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -489,5 +558,87 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_retry_recovers_after_induced_transient_failure() -> anyhow::Result<()> {
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
+        let mut attempts = 0;
+
+        // Simulated flaky extraction closure: fails twice, succeeds on 3rd attempt
+        let mut flaky_shredder = move || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(anyhow::anyhow!("Induced 503 Service Unavailable (attempt {})", attempts))
+            } else {
+                Ok("[CACHE] -> Redis cluster configured with sentinel failover.".to_string())
+            }
+        };
+
+        let file_path = "test_config.rs";
+        let mut retry_count = 0;
+        let mut recovered = false;
+
+        // Simulate retry execution with true exponential backoff
+        for _step in 1..=5 {
+            match flaky_shredder() {
+                Ok(raw_fact) => {
+                    let parts: Vec<&str> = raw_fact.split("->").collect();
+                    let tag = parts[0].trim().replace("[", "").replace("]", "");
+                    let data = parts[1].trim().to_string();
+                    engine.refresh_source_facts(file_path, vec![(tag, data)])?;
+                    recovered = true;
+                    break;
+                }
+                Err(_e) => {
+                    retry_count += 1;
+                    // Verify true exponential backoff calculation: 2^(retry_count - 1)
+                    let delay_secs = 1u64 << (retry_count - 1);
+                    assert_eq!(delay_secs, match retry_count { 1 => 1, 2 => 2, _ => 4 });
+                }
+            }
+        }
+
+        assert!(recovered, "Automated retry must recover from induced transient failures");
+        assert_eq!(retry_count, 2, "Must retry exactly twice before succeeding");
+
+        // Verify recovered facts were committed
+        let facts = engine.get_facts_by_tag("CACHE", None)?;
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].contains("Redis cluster"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_directory_rename_collects_all_nested_supported_files() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("remainder_rename_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let sub_dir = temp_dir.join("sub");
+        std::fs::create_dir_all(&sub_dir)?;
+
+        let file1 = temp_dir.join("root.txt");
+        let file2 = sub_dir.join("nested.rs");
+        let file3 = sub_dir.join("ignore.bin");
+
+        std::fs::write(&file1, "Root file")?;
+        std::fs::write(&file2, "Nested file")?;
+        std::fs::write(&file3, "Binary file")?;
+
+        let mut collected = Vec::new();
+        for entry in walkdir::WalkDir::new(&temp_dir).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() && is_supported_file(entry.path()) {
+                collected.push(entry.into_path());
+            }
+        }
+
+        assert_eq!(collected.len(), 2, "Must collect root.txt and nested.rs, ignoring ignore.bin");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 }

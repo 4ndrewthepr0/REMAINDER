@@ -5,6 +5,15 @@ pub struct RemainderEngine {
     pub conn: Connection,
 }
 
+fn clean_path_components(path: &Path) -> Vec<std::ffi::OsString> {
+    path.components()
+        .filter_map(|c| match c {
+            std::path::Component::CurDir => None,
+            _ => Some(c.as_os_str().to_os_string()),
+        })
+        .collect()
+}
+
 impl RemainderEngine {
     pub fn new(db_path: &str) -> anyhow::Result<Self> {
         let mut conn = Connection::open(db_path)?;
@@ -158,20 +167,27 @@ impl RemainderEngine {
         Ok(())
     }
 
-    pub fn get_latest_fact(&self, tag: &str) -> anyhow::Result<Option<String>> {
+    /// Retrieves all historical facts recorded under a category tag
+    pub fn get_facts_by_tag(&self, tag: &str, limit: Option<usize>) -> anyhow::Result<Vec<String>> {
+        let limit_val = limit.unwrap_or(50) as i64;
         let mut stmt = self.conn.prepare(
             "SELECT fact_content FROM atomics 
              WHERE vault_tag = ?1 COLLATE NOCASE
-             ORDER BY id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT ?2"
         )?;
         
-        let mut rows = stmt.query(params![tag])?;
-        if let Some(row) = rows.next()? {
-            let content: String = row.get(0)?;
-            Ok(Some(content))
-        } else {
-            Ok(None)
+        let rows = stmt.query_map(params![tag, limit_val], |row| row.get(0))?;
+        let mut facts = Vec::new();
+        for r in rows {
+            facts.push(r?);
         }
+        Ok(facts)
+    }
+
+    /// Convenience retrieval for single latest fact
+    pub fn get_latest_fact(&self, tag: &str) -> anyhow::Result<Option<String>> {
+        let facts = self.get_facts_by_tag(tag, Some(1))?;
+        Ok(facts.into_iter().next())
     }
 
     pub fn refresh_source_facts(&mut self, file_path: &str, facts: Vec<(String, String)>) -> anyhow::Result<usize> {
@@ -216,27 +232,40 @@ impl RemainderEngine {
         Ok(inserted)
     }
 
-    pub fn remove_source_or_prefix(&mut self, path: &str) -> anyhow::Result<usize> {
-        let normalized = path.replace("\\", "/");
-        let slash_prefix = format!("{}/%", normalized.trim_end_matches('/'));
-        let backslash_prefix = format!("{}\\%", path.trim_end_matches('\\'));
+    /// Removes a source or all nested sources in a directory using exact path component hierarchy.
+    /// Immune to SQL LIKE wildcard collisions (e.g. 'arch_notes' will never match 'archXnotes' or 'arch_notes_extra').
+    pub fn remove_source_or_prefix(&mut self, path_str: &str) -> anyhow::Result<usize> {
+        let target_comps = clean_path_components(Path::new(path_str));
+        if target_comps.is_empty() {
+            return Ok(0);
+        }
 
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM sources 
-             WHERE file_path = ?1 
-                OR file_path = ?2 
-                OR file_path LIKE ?3 
-                OR file_path LIKE ?4"
-        )?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, file_path FROM sources")?;
+            let items = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            items
+        };
 
-        let source_ids: Vec<i64> = stmt
-            .query_map(params![path, normalized, slash_prefix, backslash_prefix], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut ids_to_delete = Vec::new();
+        for (id, file_path) in rows {
+            let p_comps = clean_path_components(Path::new(&file_path));
+            // Strict component-prefix hierarchy check:
+            // p_comps must start with all components of target_comps
+            if p_comps.len() >= target_comps.len() && p_comps[..target_comps.len()] == target_comps[..] {
+                ids_to_delete.push(id);
+            }
+        }
 
         let mut deleted = 0;
-        for id in source_ids {
-            deleted += self.conn.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
+        if !ids_to_delete.is_empty() {
+            let tx = self.conn.transaction()?;
+            for id in ids_to_delete {
+                deleted += tx.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
+            }
+            tx.commit()?;
         }
 
         Ok(deleted)
@@ -343,24 +372,53 @@ mod tests {
     }
 
     #[test]
-    fn test_directory_removal_cascades_facts() -> anyhow::Result<()> {
+    fn test_directory_removal_component_matching_prevents_wildcard_bleed() -> anyhow::Result<()> {
         let mut engine = RemainderEngine::new(":memory:")?;
-        engine.refresh_source_facts("C:/docs/notes.txt", vec![("DOCS".into(), "Fact 1".into())])?;
-        engine.refresh_source_facts("C:/docs/sub/deep.txt", vec![("SUB".into(), "Fact 2".into())])?;
-        engine.refresh_source_facts("C:/other/keep.txt", vec![("OTHER".into(), "Fact 3".into())])?;
+        
+        // Populate sources: target dir, similar name with X, similar name with extra suffix
+        engine.refresh_source_facts("arch_notes/sub.txt", vec![("TARGET".into(), "Fact inside target".into())])?;
+        engine.refresh_source_facts("archXnotes/sub.txt", vec![("UNRELATED_X".into(), "Must NOT be deleted".into())])?;
+        engine.refresh_source_facts("arch_notes_extra.txt", vec![("UNRELATED_EXTRA".into(), "Must NOT be deleted".into())])?;
 
-        let count: i64 = engine.conn.query_row("SELECT count(*) FROM atomics", [], |r| r.get(0))?;
-        assert_eq!(count, 3);
+        let total_before: i64 = engine.conn.query_row("SELECT count(*) FROM atomics", [], |r| r.get(0))?;
+        assert_eq!(total_before, 3);
 
-        // Delete directory "C:/docs"
-        let deleted = engine.remove_source_or_prefix("C:/docs")?;
-        assert_eq!(deleted, 2);
+        // Delete "arch_notes" - must ONLY delete arch_notes/sub.txt, NOT archXnotes or arch_notes_extra
+        let deleted = engine.remove_source_or_prefix("arch_notes")?;
+        assert_eq!(deleted, 1, "Only exact directory prefix must be deleted");
 
-        let remaining: i64 = engine.conn.query_row("SELECT count(*) FROM atomics", [], |r| r.get(0))?;
-        assert_eq!(remaining, 1);
+        // Verify archXnotes still intact
+        let x_fact = engine.get_latest_fact("UNRELATED_X")?;
+        assert_eq!(x_fact.as_deref(), Some("Must NOT be deleted"));
 
-        let kept: String = engine.conn.query_row("SELECT vault_tag FROM atomics", [], |r| r.get(0))?;
-        assert_eq!(kept, "OTHER");
+        // Verify arch_notes_extra still intact
+        let extra_fact = engine.get_latest_fact("UNRELATED_EXTRA")?;
+        assert_eq!(extra_fact.as_deref(), Some("Must NOT be deleted"));
+
+        // Verify target fact was purged
+        let target_fact = engine.get_latest_fact("TARGET")?;
+        assert_eq!(target_fact, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_fact_retrieval_preserves_decision_details() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+        
+        // Ingest multiple architectural decisions under DATABASE
+        let decisions = vec![
+            ("DATABASE".to_string(), "Decided WAL mode for non-blocking concurrent reads.".to_string()),
+            ("DATABASE".to_string(), "Configured synchronous=NORMAL for power-loss safety.".to_string()),
+            ("DATABASE".to_string(), "Enforced foreign_keys=ON for cascade consistency.".to_string()),
+        ];
+        engine.refresh_source_facts("arch.txt", decisions)?;
+
+        let all_db_facts = engine.get_facts_by_tag("DATABASE", None)?;
+        assert_eq!(all_db_facts.len(), 3, "All decisions under tag must be retrieved");
+        assert!(all_db_facts.iter().any(|f| f.contains("WAL mode")));
+        assert!(all_db_facts.iter().any(|f| f.contains("synchronous=NORMAL")));
+        assert!(all_db_facts.iter().any(|f| f.contains("foreign_keys=ON")));
 
         Ok(())
     }
