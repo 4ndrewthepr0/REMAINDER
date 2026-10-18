@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection};
 use std::path::Path;
+use std::collections::HashSet;
 
 pub struct RemainderEngine {
     pub conn: Connection,
@@ -12,6 +13,26 @@ fn clean_path_components(path: &Path) -> Vec<std::ffi::OsString> {
             _ => Some(c.as_os_str().to_os_string()),
         })
         .collect()
+}
+
+pub fn sanitize_fts5_query(query: &str) -> String {
+    let words: Vec<&str> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub vault_tag: String,
+    pub fact_content: String,
+    pub file_path: String,
+    pub raw_excerpt: Option<String>,
+    pub bm25_rank: f64,
 }
 
 impl RemainderEngine {
@@ -39,6 +60,7 @@ impl RemainderEngine {
                 "CREATE TABLE IF NOT EXISTS sources (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      file_path TEXT UNIQUE NOT NULL,
+                     raw_content TEXT,
                      last_shredded DATETIME DEFAULT CURRENT_TIMESTAMP
                  );
 
@@ -98,7 +120,6 @@ impl RemainderEngine {
                     "1"
                 };
 
-                // Fallback to random 16-byte hex if hash is NULL or empty
                 let hash_expr = if has_hash {
                     "COALESCE(NULLIF(hash, ''), hex(randomblob(16)))"
                 } else {
@@ -117,10 +138,8 @@ impl RemainderEngine {
                     source_expr, hash_expr, created_at_expr
                 );
 
-                // Strictly propagate copy errors (no INSERT OR IGNORE)
                 tx.execute(&copy_sql, [])?;
 
-                // Invariant verification check: new count must match old count exactly
                 let new_count: i64 = tx.query_row("SELECT count(*) FROM atomics_v2", [], |r| r.get(0))?;
                 if new_count != old_count {
                     anyhow::bail!(
@@ -140,11 +159,58 @@ impl RemainderEngine {
             )?;
 
             tx.commit()?;
+        }
+
+        // Migration to version 3: FTS5 full-text / natural language search & raw source text preservation
+        let current_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current_version < 3 {
+            let tx = conn.transaction()?;
+
+            // Check if raw_content exists on sources
+            let has_raw_content: bool = {
+                let mut stmt = tx.prepare("PRAGMA table_info(sources)")?;
+                let cols: Vec<String> = stmt.query_map([], |r| r.get(1))?.filter_map(|r| r.ok()).collect();
+                cols.contains(&"raw_content".to_string())
+            };
+            if !has_raw_content {
+                tx.execute_batch("ALTER TABLE sources ADD COLUMN raw_content TEXT;")?;
+            }
+
+            // Create FTS5 virtual table for BM25 natural language search
+            tx.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS atomics_fts USING fts5(
+                     vault_tag,
+                     fact_content,
+                     content='atomics',
+                     content_rowid='id'
+                 );
+
+                 CREATE TRIGGER IF NOT EXISTS atomics_ai AFTER INSERT ON atomics BEGIN
+                     INSERT INTO atomics_fts(rowid, vault_tag, fact_content) VALUES (new.id, new.vault_tag, new.fact_content);
+                 END;
+
+                 CREATE TRIGGER IF NOT EXISTS atomics_ad AFTER DELETE ON atomics BEGIN
+                     INSERT INTO atomics_fts(atomics_fts, rowid, vault_tag, fact_content) VALUES('delete', old.id, old.vault_tag, old.fact_content);
+                 END;
+
+                 CREATE TRIGGER IF NOT EXISTS atomics_au AFTER UPDATE ON atomics BEGIN
+                     INSERT INTO atomics_fts(atomics_fts, rowid, vault_tag, fact_content) VALUES('delete', old.id, old.vault_tag, old.fact_content);
+                     INSERT INTO atomics_fts(rowid, vault_tag, fact_content) VALUES (new.id, new.vault_tag, new.fact_content);
+                 END;
+
+                 INSERT OR IGNORE INTO atomics_fts(rowid, vault_tag, fact_content)
+                 SELECT id, vault_tag, fact_content FROM atomics;
+
+                 PRAGMA user_version = 3;"
+            )?;
+
+            tx.commit()?;
         } else {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS sources (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      file_path TEXT UNIQUE NOT NULL,
+                     raw_content TEXT,
                      last_shredded DATETIME DEFAULT CURRENT_TIMESTAMP
                  );
 
@@ -160,7 +226,14 @@ impl RemainderEngine {
                  );
 
                  CREATE INDEX IF NOT EXISTS idx_atomics_tag ON atomics(vault_tag COLLATE NOCASE);
-                 CREATE INDEX IF NOT EXISTS idx_atomics_source ON atomics(source_id);"
+                 CREATE INDEX IF NOT EXISTS idx_atomics_source ON atomics(source_id);
+
+                 CREATE VIRTUAL TABLE IF NOT EXISTS atomics_fts USING fts5(
+                     vault_tag,
+                     fact_content,
+                     content='atomics',
+                     content_rowid='id'
+                 );"
             )?;
         }
 
@@ -185,21 +258,100 @@ impl RemainderEngine {
         Ok(facts)
     }
 
+    /// Natural-language & Tag search: runs BM25 lexical ranking across facts with exact tag boosting
+    pub fn search(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<SearchHit>> {
+        let max_results = limit.unwrap_or(20);
+        let mut results = Vec::new();
+        let mut seen_ids = HashSet::new();
+
+        // 1. Direct tag lookup (for queries that match a category tag like 'DATABASE' or 'SECURITY')
+        let mut tag_stmt = self.conn.prepare(
+            "SELECT a.id, a.vault_tag, a.fact_content, s.file_path, s.raw_content
+             FROM atomics a
+             JOIN sources s ON s.id = a.source_id
+             WHERE a.vault_tag = ?1 COLLATE NOCASE
+             ORDER BY a.id DESC LIMIT ?2"
+        )?;
+
+        let tag_rows = tag_stmt.query_map(params![query, max_results], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+
+        for r in tag_rows {
+            let (id, tag, content, file_path, raw) = r?;
+            seen_ids.insert(id);
+            results.push(SearchHit {
+                vault_tag: tag,
+                fact_content: content,
+                file_path,
+                raw_excerpt: raw.map(|t| t.chars().take(300).collect()),
+                bm25_rank: -100.0, // High priority boost for exact tag match
+            });
+        }
+
+        // 2. Natural language FTS5 BM25 search
+        let fts_query = sanitize_fts5_query(query);
+        if !fts_query.is_empty() {
+            let mut fts_stmt = self.conn.prepare(
+                "SELECT a.id, a.vault_tag, a.fact_content, s.file_path, s.raw_content, bm25(atomics_fts) as rank
+                 FROM atomics_fts f
+                 JOIN atomics a ON a.id = f.rowid
+                 JOIN sources s ON s.id = a.source_id
+                 WHERE atomics_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2"
+            )?;
+
+            let fts_rows = fts_stmt.query_map(params![fts_query, max_results], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, f64>(5)?,
+                ))
+            })?;
+
+            for r in fts_rows {
+                let (id, tag, content, file_path, raw, rank) = r?;
+                if !seen_ids.contains(&id) {
+                    seen_ids.insert(id);
+                    results.push(SearchHit {
+                        vault_tag: tag,
+                        fact_content: content,
+                        file_path,
+                        raw_excerpt: raw.map(|t| t.chars().take(300).collect()),
+                        bm25_rank: rank,
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Convenience retrieval for single latest fact
     pub fn get_latest_fact(&self, tag: &str) -> anyhow::Result<Option<String>> {
         let facts = self.get_facts_by_tag(tag, Some(1))?;
         Ok(facts.into_iter().next())
     }
 
-    pub fn refresh_source_facts(&mut self, file_path: &str, facts: Vec<(String, String)>) -> anyhow::Result<usize> {
+    pub fn refresh_source_facts(&mut self, file_path: &str, raw_content: Option<&str>, facts: Vec<(String, String)>) -> anyhow::Result<usize> {
         use sha2::{Sha256, Digest};
         let tx = self.conn.transaction()?;
 
-        // 1. Upsert source entry
+        // 1. Upsert source entry with raw_content preserved
         tx.execute(
-            "INSERT INTO sources (file_path, last_shredded) VALUES (?1, CURRENT_TIMESTAMP)
-             ON CONFLICT(file_path) DO UPDATE SET last_shredded = CURRENT_TIMESTAMP",
-            params![file_path],
+            "INSERT INTO sources (file_path, raw_content, last_shredded) VALUES (?1, ?2, CURRENT_TIMESTAMP)
+             ON CONFLICT(file_path) DO UPDATE SET raw_content = ?2, last_shredded = CURRENT_TIMESTAMP",
+            params![file_path, raw_content],
         )?;
 
         let source_id: i64 = tx.query_row(
@@ -253,8 +405,6 @@ impl RemainderEngine {
         let mut ids_to_delete = Vec::new();
         for (id, file_path) in rows {
             let p_comps = clean_path_components(Path::new(&file_path));
-            // Strict component-prefix hierarchy check:
-            // p_comps must start with all components of target_comps
             if p_comps.len() >= target_comps.len() && p_comps[..target_comps.len()] == target_comps[..] {
                 ids_to_delete.push(id);
             }
@@ -303,6 +453,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_sqlite_fts5_natural_language_search_and_provenance() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+
+        let doc1 = "We configured SQLite in WAL mode with synchronous=NORMAL for concurrent sub-millisecond writes.";
+        let doc2 = "All inter-service RPC calls enforce Ed25519 digital signatures for zero-trust authorization.";
+
+        engine.refresh_source_facts("db_config.txt", Some(doc1), vec![
+            ("DATABASE".into(), "SQLite is configured in WAL mode with synchronous=NORMAL.".into()),
+        ])?;
+
+        engine.refresh_source_facts("rpc_security.txt", Some(doc2), vec![
+            ("SECURITY".into(), "Ed25519 signatures are used for inter-service RPC authorization.".into()),
+        ])?;
+
+        // 1. Natural language query without specifying category tag
+        let hits = engine.search("How do we authorize RPC calls?", None)?;
+        assert!(!hits.is_empty(), "FTS5 BM25 search must find relevant facts from natural language questions");
+        assert_eq!(hits[0].vault_tag, "SECURITY");
+        assert!(hits[0].fact_content.contains("Ed25519"));
+        assert_eq!(hits[0].file_path, "rpc_security.txt");
+        assert!(hits[0].raw_excerpt.as_ref().unwrap().contains("zero-trust authorization"));
+
+        // 2. Natural language query for database performance
+        let db_hits = engine.search("concurrent writes and WAL mode", None)?;
+        assert!(!db_hits.is_empty());
+        assert_eq!(db_hits[0].vault_tag, "DATABASE");
+        assert!(db_hits[0].fact_content.contains("WAL mode"));
+        assert_eq!(db_hits[0].file_path, "db_config.txt");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_migration_preserves_null_hash_rows() -> anyhow::Result<()> {
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(
@@ -335,7 +518,7 @@ mod tests {
         let non_null_hash: String = conn.query_row("SELECT hash FROM atomics WHERE vault_tag = 'DATABASE'", [], |r| r.get(0))?;
 
         assert_eq!(after_count, 1, "Fact must not be lost!");
-        assert_eq!(new_version, 2, "user_version must be 2");
+        assert_eq!(new_version, 3, "user_version must be upgraded to 3");
         assert!(!non_null_hash.is_empty(), "Hash must be populated and non-null");
 
         Ok(())
@@ -367,7 +550,7 @@ mod tests {
         let new_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
         assert_eq!(after_count, 1, "Fact without source_id must be preserved");
-        assert_eq!(new_version, 2);
+        assert_eq!(new_version, 3);
 
         Ok(())
     }
@@ -376,27 +559,22 @@ mod tests {
     fn test_directory_removal_component_matching_prevents_wildcard_bleed() -> anyhow::Result<()> {
         let mut engine = RemainderEngine::new(":memory:")?;
         
-        // Populate sources: target dir, similar name with X, similar name with extra suffix
-        engine.refresh_source_facts("arch_notes/sub.txt", vec![("TARGET".into(), "Fact inside target".into())])?;
-        engine.refresh_source_facts("archXnotes/sub.txt", vec![("UNRELATED_X".into(), "Must NOT be deleted".into())])?;
-        engine.refresh_source_facts("arch_notes_extra.txt", vec![("UNRELATED_EXTRA".into(), "Must NOT be deleted".into())])?;
+        engine.refresh_source_facts("arch_notes/sub.txt", None, vec![("TARGET".into(), "Fact inside target".into())])?;
+        engine.refresh_source_facts("archXnotes/sub.txt", None, vec![("UNRELATED_X".into(), "Must NOT be deleted".into())])?;
+        engine.refresh_source_facts("arch_notes_extra.txt", None, vec![("UNRELATED_EXTRA".into(), "Must NOT be deleted".into())])?;
 
         let total_before: i64 = engine.conn.query_row("SELECT count(*) FROM atomics", [], |r| r.get(0))?;
         assert_eq!(total_before, 3);
 
-        // Delete "arch_notes" - must ONLY delete arch_notes/sub.txt, NOT archXnotes or arch_notes_extra
         let deleted = engine.remove_source_or_prefix("arch_notes")?;
         assert_eq!(deleted, 1, "Only exact directory prefix must be deleted");
 
-        // Verify archXnotes still intact
         let x_fact = engine.get_latest_fact("UNRELATED_X")?;
         assert_eq!(x_fact.as_deref(), Some("Must NOT be deleted"));
 
-        // Verify arch_notes_extra still intact
         let extra_fact = engine.get_latest_fact("UNRELATED_EXTRA")?;
         assert_eq!(extra_fact.as_deref(), Some("Must NOT be deleted"));
 
-        // Verify target fact was purged
         let target_fact = engine.get_latest_fact("TARGET")?;
         assert_eq!(target_fact, None);
 
@@ -407,13 +585,12 @@ mod tests {
     fn test_multi_fact_retrieval_preserves_decision_details() -> anyhow::Result<()> {
         let mut engine = RemainderEngine::new(":memory:")?;
         
-        // Ingest multiple architectural decisions under DATABASE
         let decisions = vec![
             ("DATABASE".to_string(), "Decided WAL mode for non-blocking concurrent reads.".to_string()),
             ("DATABASE".to_string(), "Configured synchronous=NORMAL for power-loss safety.".to_string()),
             ("DATABASE".to_string(), "Enforced foreign_keys=ON for cascade consistency.".to_string()),
         ];
-        engine.refresh_source_facts("arch.txt", decisions)?;
+        engine.refresh_source_facts("arch.txt", None, decisions)?;
 
         let all_db_facts = engine.get_facts_by_tag("DATABASE", None)?;
         assert_eq!(all_db_facts.len(), 3, "All decisions under tag must be retrieved");
@@ -436,11 +613,9 @@ mod tests {
              INSERT INTO atomics (vault_tag) VALUES ('ARCH');"
         )?;
 
-        // Old table is missing 'fact_content' column entirely, so copy will fail
         let res = RemainderEngine::run_migrations(&mut conn);
         assert!(res.is_err(), "Migration must fail and return error when required columns cannot be copied");
 
-        // Verify transaction rolled back: original table still exists and user_version is still 1
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         assert_eq!(version, 1, "user_version must not be upgraded on failure");
 

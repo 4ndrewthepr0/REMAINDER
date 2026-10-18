@@ -157,7 +157,7 @@ pub fn process_inference_result(
     let file_str = path.to_string_lossy().to_string();
 
     let content = match current_content {
-        Some(c) => c,
+        Some(ref c) => c,
         None => {
             println!("[RACE GUARD] File '{}' disappeared during inference. Stale result discarded.", file_name);
             return Ok(InferenceOutcome::DiscardedStale);
@@ -206,9 +206,9 @@ pub fn process_inference_result(
                 println!("[BUNKER] Atomic Truth: [{}] -> {}", tag, data);
             }
 
-            match engine.refresh_source_facts(&file_str, facts_to_insert) {
+            match engine.refresh_source_facts(&file_str, current_content.as_deref(), facts_to_insert) {
                 Ok(count) => {
-                    println!("[PROVENANCE] Updated {} facts for source '{}'. Stale facts purged.", count, file_name);
+                    println!("[PROVENANCE] Updated {} facts for source '{}'. Raw source text preserved.", count, file_name);
                     let _ = engine.checkpoint();
                     pending_files.remove(&path);
                     Ok(InferenceOutcome::Committed(count))
@@ -295,13 +295,14 @@ fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> 
                     "result": {
                         "tools": [{
                             "name": "query_bunker",
-                            "description": "Retrieves up to 50 current technical facts from the local REMAINDER vault.",
+                            "description": "Retrieves technical facts from the local REMAINDER vault using natural-language search (BM25) or category tag lookup, with source file provenance and context excerpts.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "tag": { "type": "string", "description": "Category (e.g. DATABASE, AUTH)" }
+                                    "query": { "type": "string", "description": "Natural-language query (e.g. 'How do we authorize RPC calls?') or category tag (e.g. 'DATABASE', 'AUTH')" },
+                                    "tag": { "type": "string", "description": "Optional category tag (backward compatibility)" }
                                 },
-                                "required": ["tag"]
+                                "required": ["query"]
                             }
                         }]
                     }
@@ -310,21 +311,30 @@ fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> 
             "tools/call" => {
                 let params = req.get("params");
                 let name = params.and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-                let tag = params
+                let query = params
                     .and_then(|p| p.get("arguments"))
-                    .and_then(|a| a.get("tag"))
+                    .and_then(|a| a.get("query").or_else(|| a.get("tag")))
                     .and_then(|t| t.as_str())
                     .unwrap_or("");
 
                 let text = if name == "query_bunker" {
-                    match engine.get_facts_by_tag(tag, Some(50)) {
-                        Ok(facts) if !facts.is_empty() => {
-                            facts.iter()
-                                .map(|f| format!("[BUNKER] {} -> {}", tag, f))
+                    match engine.search(query, Some(20)) {
+                        Ok(hits) if !hits.is_empty() => {
+                            hits.iter()
+                                .map(|h| {
+                                    let mut s = format!("[BUNKER] [{}] -> {}", h.vault_tag, h.fact_content);
+                                    s.push_str(&format!("\n  Source: {}", h.file_path));
+                                    if let Some(ref exc) = h.raw_excerpt {
+                                        let single_line = exc.lines().collect::<Vec<_>>().join(" ");
+                                        let preview: String = single_line.chars().take(150).collect();
+                                        s.push_str(&format!("\n  Context: \"{}\"", preview));
+                                    }
+                                    s
+                                })
                                 .collect::<Vec<_>>()
-                                .join("\n")
+                                .join("\n\n")
                         }
-                        Ok(_) => format!("[BUNKER] No records found for tag: {}", tag),
+                        Ok(_) => format!("[BUNKER] No records found for query: {}", query),
                         Err(e) => format!("Error querying bunker: {}", e),
                     }
                 } else {
@@ -375,22 +385,34 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", json!({
                 "tools": [{
                     "name": "query_bunker",
-                    "description": "Retrieves up to 50 current technical facts from the local REMAINDER vault.",
+                    "description": "Retrieves technical facts from the local REMAINDER vault using natural-language search (BM25) or category tag lookup, with source file provenance and context excerpts.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "tag": { "type": "string", "description": "Category (e.g. DATABASE, AUTH)" }
+                            "query": { "type": "string", "description": "Natural-language query or category tag" },
+                            "tag": { "type": "string", "description": "Optional category tag filter" }
                         },
-                        "required": ["tag"]
+                        "required": ["query"]
                     }
                 }]
             }));
             return Ok(());
         } else if args.len() > 3 && args[2] == "call" {
-            let tag = &args[3];
-            let facts = engine.get_facts_by_tag(tag, Some(50))?;
-            if !facts.is_empty() {
-                let combined = facts.join("\n");
+            let query = &args[3];
+            let hits = engine.search(query, Some(20))?;
+            if !hits.is_empty() {
+                let combined = hits.iter()
+                    .map(|h| {
+                        let mut s = format!("[{}] -> {}\n  Source: {}", h.vault_tag, h.fact_content, h.file_path);
+                        if let Some(ref exc) = h.raw_excerpt {
+                            let single_line = exc.lines().collect::<Vec<_>>().join(" ");
+                            let preview: String = single_line.chars().take(150).collect();
+                            s.push_str(&format!("\n  Context: \"{}\"", preview));
+                        }
+                        s
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 println!("{}", json!({ "content": [{ "type": "text", "text": combined }] }));
             } else {
                 println!("{}", json!({ "content": [{ "type": "text", "text": "No records found." }] }));
@@ -401,15 +423,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- CLI QUERY MODE (Multi-fact retrieval) ---
+    // --- CLI QUERY MODE (Natural-language & Multi-fact retrieval) ---
     if args.len() > 2 && args[1] == "query" {
-        let tag = &args[2];
-        let facts = engine.get_facts_by_tag(tag, Some(50))?;
-        if facts.is_empty() {
-            println!("[BUNKER] No records found for tag: {}", tag);
+        let query = &args[2];
+        let hits = engine.search(query, Some(20))?;
+        if hits.is_empty() {
+            println!("[BUNKER] No records found for query: {}", query);
         } else {
-            for fact in facts {
-                println!("[BUNKER] {} -> {}", tag, fact);
+            for hit in hits {
+                println!("[BUNKER] [{}] -> {}", hit.vault_tag, hit.fact_content);
+                println!("         Source: {}", hit.file_path);
+                if let Some(ref exc) = hit.raw_excerpt {
+                    let single_line = exc.lines().collect::<Vec<_>>().join(" ");
+                    let preview: String = single_line.chars().take(140).collect();
+                    println!("         Context: \"{}\"", preview);
+                }
             }
         }
         return Ok(());
@@ -560,7 +588,7 @@ async fn main() -> anyhow::Result<()> {
 
                     if content.trim().is_empty() {
                         pending_files.remove(&path);
-                        match engine.refresh_source_facts(&file_str, Vec::new()) {
+                        match engine.refresh_source_facts(&file_str, Some(""), Vec::new()) {
                             Ok(_) => {
                                 println!("\n[GHOST] Source file '{}' emptied. All associated facts cleared.", file_name);
                                 let _ = engine.checkpoint();
@@ -758,7 +786,7 @@ mod tests {
 
         // 1. Ingest under original path
         let source_str = source_file.to_string_lossy().to_string();
-        engine.refresh_source_facts(&source_str, vec![("COMM".to_string(), "gRPC chosen over HTTP/2".to_string())])?;
+        engine.refresh_source_facts(&source_str, Some("gRPC chosen over HTTP/2"), vec![("COMM".to_string(), "gRPC chosen over HTTP/2".to_string())])?;
         assert_eq!(engine.get_facts_by_tag("COMM", None)?.len(), 1);
 
         // 2. Perform actual filesystem rename
@@ -784,6 +812,63 @@ mod tests {
         assert!(pending_files.contains_key(&expected_relocated_file), "Production rename handler must schedule relocated nested files");
 
         let _ = std::fs::remove_dir_all(&base_temp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_production_natural_language_bm25_search_and_provenance() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("remainder_nl_bm25_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let doc_path = temp_dir.join("db_adr.md");
+        let raw_text = "Architecture Decision Record: Persistence Layer\n\
+                        We adopt PostgreSQL 16 for all relational data with max_connections=25.\n\
+                        MongoDB was rejected due to lack of multi-document ACID transactions.\n\
+                        All migrations must run through goose with strict backward compatibility.";
+        std::fs::write(&doc_path, raw_text)?;
+
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
+        let mut pending_files = HashMap::new();
+        let mut in_flight = HashSet::new();
+
+        let input_hash = compute_file_hash(raw_text);
+        let llm_response = Ok(
+            "[DATABASE] -> Adopted PostgreSQL 16 with max_connections=25.\n\
+             [ARCHITECTURE] -> Rejected MongoDB due to lack of multi-document ACID transactions."
+                .to_string(),
+        );
+
+        // Process through production inference pipeline with full raw content
+        let outcome = process_inference_result(
+            doc_path.clone(),
+            input_hash,
+            llm_response,
+            &mut engine,
+            &mut pending_files,
+            &mut in_flight,
+            1,
+            Some(raw_text.to_string()),
+        )?;
+
+        assert_eq!(outcome, InferenceOutcome::Committed(2), "Must commit both atomic propositions");
+
+        // 1. Natural language query containing words from document not in the tag ('MongoDB' and 'transactions')
+        let hits = engine.search("Why did we reject MongoDB for transactions?", None)?;
+        assert!(!hits.is_empty(), "FTS5 BM25 search must find relevant facts from natural language query");
+        assert_eq!(hits[0].vault_tag, "ARCHITECTURE");
+        assert!(hits[0].fact_content.contains("Rejected MongoDB"));
+        assert_eq!(hits[0].file_path, doc_path.to_string_lossy());
+        assert!(hits[0].raw_excerpt.as_ref().unwrap().contains("Architecture Decision Record: Persistence Layer"));
+
+        // 2. Exact tag lookup query ('DATABASE') gets highest priority boost (-100.0 rank)
+        let tag_hits = engine.search("DATABASE", None)?;
+        assert!(!tag_hits.is_empty());
+        assert_eq!(tag_hits[0].vault_tag, "DATABASE");
+        assert_eq!(tag_hits[0].bm25_rank, -100.0, "Exact tag matches receive priority boost");
+        assert!(tag_hits[0].fact_content.contains("PostgreSQL 16"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 }
