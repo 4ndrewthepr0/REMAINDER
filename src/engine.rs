@@ -26,6 +26,54 @@ pub fn sanitize_fts5_query(query: &str) -> String {
     words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ")
 }
 
+pub fn extract_passage(raw: &str, query: &str, max_len: usize) -> String {
+    let query_terms: Vec<&str> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 3)
+        .collect();
+
+    let raw_lower = raw.to_lowercase();
+    let mut best_pos = None;
+
+    for term in query_terms {
+        let term_lower = term.to_lowercase();
+        if let Some(pos) = raw_lower.find(&term_lower) {
+            best_pos = Some(pos);
+            break;
+        }
+    }
+
+    match best_pos {
+        Some(pos) => {
+            let start = pos.saturating_sub(60);
+            let end = (start + max_len).min(raw.len());
+            let snippet = &raw[start..end];
+            let single_line = snippet.lines().collect::<Vec<_>>().join(" ");
+            let trimmed = single_line.trim();
+            let mut result = String::new();
+            if start > 0 {
+                result.push_str("... ");
+            }
+            result.push_str(trimmed);
+            if end < raw.len() {
+                result.push_str(" ...");
+            }
+            result
+        }
+        None => {
+            let end = max_len.min(raw.len());
+            let snippet = &raw[..end];
+            let single_line = snippet.lines().collect::<Vec<_>>().join(" ");
+            let trimmed = single_line.trim().to_string();
+            if end < raw.len() {
+                format!("{} ...", trimmed)
+            } else {
+                trimmed
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub vault_tag: String,
@@ -47,7 +95,10 @@ impl RemainderEngine {
 
         Self::run_migrations(&mut conn)?;
 
-        Ok(Self { conn })
+        let mut engine = Self { conn };
+        let _ = engine.backfill_existing_sources();
+
+        Ok(engine)
     }
 
     pub fn run_migrations(conn: &mut Connection) -> anyhow::Result<()> {
@@ -161,12 +212,11 @@ impl RemainderEngine {
             tx.commit()?;
         }
 
-        // Migration to version 3: FTS5 full-text / natural language search & raw source text preservation
-        let current_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if current_version < 3 {
+        // Migration to version 3: FTS5 full-text / natural language search & raw source text column
+        let v3_check: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v3_check < 3 {
             let tx = conn.transaction()?;
 
-            // Check if raw_content exists on sources
             let has_raw_content: bool = {
                 let mut stmt = tx.prepare("PRAGMA table_info(sources)")?;
                 let cols: Vec<String> = stmt.query_map([], |r| r.get(1))?.filter_map(|r| r.ok()).collect();
@@ -176,7 +226,6 @@ impl RemainderEngine {
                 tx.execute_batch("ALTER TABLE sources ADD COLUMN raw_content TEXT;")?;
             }
 
-            // Create FTS5 virtual table for BM25 natural language search
             tx.execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS atomics_fts USING fts5(
                      vault_tag,
@@ -205,43 +254,120 @@ impl RemainderEngine {
             )?;
 
             tx.commit()?;
-        } else {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS sources (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     file_path TEXT UNIQUE NOT NULL,
-                     raw_content TEXT,
-                     last_shredded DATETIME DEFAULT CURRENT_TIMESTAMP
-                 );
+        }
 
-                 CREATE TABLE IF NOT EXISTS atomics (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     source_id INTEGER NOT NULL,
-                     vault_tag TEXT NOT NULL,
-                     fact_content TEXT NOT NULL,
-                     hash TEXT NOT NULL,
-                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                     FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE,
-                     UNIQUE(source_id, hash)
-                 );
+        // Migration to version 4: FTS5 full-text indexing of raw source text & passages
+        let v4_check: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v4_check < 4 {
+            let tx = conn.transaction()?;
 
-                 CREATE INDEX IF NOT EXISTS idx_atomics_tag ON atomics(vault_tag COLLATE NOCASE);
-                 CREATE INDEX IF NOT EXISTS idx_atomics_source ON atomics(source_id);
-
-                 CREATE VIRTUAL TABLE IF NOT EXISTS atomics_fts USING fts5(
-                     vault_tag,
-                     fact_content,
-                     content='atomics',
+            tx.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS sources_fts USING fts5(
+                     file_path,
+                     raw_content,
+                     content='sources',
                      content_rowid='id'
-                 );"
+                 );
+
+                 CREATE TRIGGER IF NOT EXISTS sources_ai AFTER INSERT ON sources BEGIN
+                     INSERT INTO sources_fts(rowid, file_path, raw_content) VALUES (new.id, new.file_path, coalesce(new.raw_content, ''));
+                 END;
+
+                 CREATE TRIGGER IF NOT EXISTS sources_ad AFTER DELETE ON sources BEGIN
+                     INSERT INTO sources_fts(sources_fts, rowid, file_path, raw_content) VALUES('delete', old.id, old.file_path, coalesce(old.raw_content, ''));
+                 END;
+
+                 CREATE TRIGGER IF NOT EXISTS sources_au AFTER UPDATE ON sources BEGIN
+                     INSERT INTO sources_fts(sources_fts, rowid, file_path, raw_content) VALUES('delete', old.id, old.file_path, coalesce(old.raw_content, ''));
+                     INSERT INTO sources_fts(rowid, file_path, raw_content) VALUES (new.id, new.file_path, coalesce(new.raw_content, ''));
+                 END;
+
+                 INSERT OR IGNORE INTO sources_fts(rowid, file_path, raw_content)
+                 SELECT id, file_path, coalesce(raw_content, '') FROM sources;
+
+                 PRAGMA user_version = 4;"
             )?;
+
+            tx.commit()?;
         }
 
         Ok(())
     }
 
+    /// Backfills existing sources whose raw_content is NULL by reading from disk
+    pub fn backfill_existing_sources(&mut self) -> anyhow::Result<usize> {
+        let mut stmt = self.conn.prepare("SELECT id, file_path FROM sources WHERE raw_content IS NULL OR raw_content = ''")?;
+        let rows: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut backfilled = 0;
+        for (id, file_path) in rows {
+            if file_path == "__legacy__" || file_path.starts_with("__legacy_source_") {
+                continue;
+            }
+            let p = Path::new(&file_path);
+            if p.exists() && p.is_file() {
+                if let Ok(content) = std::fs::read_to_string(p) {
+                    self.conn.execute(
+                        "UPDATE sources SET raw_content = ?1 WHERE id = ?2",
+                        params![content, id],
+                    )?;
+                    backfilled += 1;
+                }
+            }
+        }
+        Ok(backfilled)
+    }
+
+    /// Immediately records/persists raw source content, guaranteeing it is indexed and searchable
+    /// even if LLM proposition extraction fails or is delayed.
+    pub fn record_source_content(&mut self, file_path: &str, raw_content: &str) -> anyhow::Result<i64> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sources (file_path, raw_content, last_shredded) VALUES (?1, ?2, CURRENT_TIMESTAMP)
+             ON CONFLICT(file_path) DO UPDATE SET raw_content = ?2, last_shredded = CURRENT_TIMESTAMP",
+            params![file_path, raw_content],
+        )?;
+        let source_id: i64 = tx.query_row(
+            "SELECT id FROM sources WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(source_id)
+    }
+
+    /// Retrieves full preserved raw source text by exact or suffix path match
+    pub fn get_source_content(&self, file_path_query: &str) -> anyhow::Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT raw_content FROM sources WHERE file_path = ?1")?;
+        let mut rows = stmt.query(params![file_path_query])?;
+        if let Some(row) = rows.next()? {
+            let content: Option<String> = row.get(0)?;
+            if content.is_some() {
+                return Ok(content);
+            }
+        }
+
+        let target_comps = clean_path_components(Path::new(file_path_query));
+        if !target_comps.is_empty() {
+            let mut all_stmt = self.conn.prepare("SELECT file_path, raw_content FROM sources WHERE raw_content IS NOT NULL")?;
+            let items: Vec<(String, String)> = all_stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (fp, content) in items {
+                let p_comps = clean_path_components(Path::new(&fp));
+                if p_comps.len() >= target_comps.len() && p_comps.ends_with(&target_comps) {
+                    return Ok(Some(content));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Retrieves up to `limit` (default 50) current facts recorded under a category tag.
-    /// Note: source refreshes replace prior facts for that source to maintain clean provenance.
     pub fn get_facts_by_tag(&self, tag: &str, limit: Option<usize>) -> anyhow::Result<Vec<String>> {
         let limit_val = limit.unwrap_or(50) as i64;
         let mut stmt = self.conn.prepare(
@@ -258,15 +384,20 @@ impl RemainderEngine {
         Ok(facts)
     }
 
-    /// Natural-language & Tag search: runs BM25 lexical ranking across facts with exact tag boosting
+    /// Unified Natural-language & Tag search:
+    /// 1. Exact tag matches receive -100.0 priority boost.
+    /// 2. Natural language FTS5 BM25 search over atomic propositions.
+    /// 3. Raw source FTS5 BM25 search (surfaces details omitted by LLM extraction).
+    /// 4. Merged ranking with strict limit enforcement across all branches.
     pub fn search(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<SearchHit>> {
         let max_results = limit.unwrap_or(20);
         let mut results = Vec::new();
-        let mut seen_ids = HashSet::new();
+        let mut seen_atomic_ids = HashSet::new();
+        let mut seen_source_ids = HashSet::new();
 
-        // 1. Direct tag lookup (for queries that match a category tag like 'DATABASE' or 'SECURITY')
+        // 1. Direct tag lookup (for queries matching a category tag like 'DATABASE' or 'SECURITY')
         let mut tag_stmt = self.conn.prepare(
-            "SELECT a.id, a.vault_tag, a.fact_content, s.file_path, s.raw_content
+            "SELECT a.id, a.vault_tag, a.fact_content, s.id, s.file_path, s.raw_content
              FROM atomics a
              JOIN sources s ON s.id = a.source_id
              WHERE a.vault_tag = ?1 COLLATE NOCASE
@@ -278,28 +409,31 @@ impl RemainderEngine {
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
 
         for r in tag_rows {
-            let (id, tag, content, file_path, raw) = r?;
-            seen_ids.insert(id);
+            let (id, tag, content, s_id, file_path, raw) = r?;
+            seen_atomic_ids.insert(id);
+            seen_source_ids.insert(s_id);
+            let excerpt = raw.map(|t| extract_passage(&t, query, 300));
             results.push(SearchHit {
                 vault_tag: tag,
                 fact_content: content,
                 file_path,
-                raw_excerpt: raw.map(|t| t.chars().take(300).collect()),
+                raw_excerpt: excerpt,
                 bm25_rank: -100.0, // High priority boost for exact tag match
             });
         }
 
-        // 2. Natural language FTS5 BM25 search
+        // 2. Natural language FTS5 BM25 search over atomic propositions
         let fts_query = sanitize_fts5_query(query);
         if !fts_query.is_empty() {
             let mut fts_stmt = self.conn.prepare(
-                "SELECT a.id, a.vault_tag, a.fact_content, s.file_path, s.raw_content, bm25(atomics_fts) as rank
+                "SELECT a.id, a.vault_tag, a.fact_content, s.id, s.file_path, s.raw_content, bm25(atomics_fts) as rank
                  FROM atomics_fts f
                  JOIN atomics a ON a.id = f.rowid
                  JOIN sources s ON s.id = a.source_id
@@ -313,26 +447,70 @@ impl RemainderEngine {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, f64>(5)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, f64>(6)?,
                 ))
             })?;
 
             for r in fts_rows {
-                let (id, tag, content, file_path, raw, rank) = r?;
-                if !seen_ids.contains(&id) {
-                    seen_ids.insert(id);
+                let (id, tag, content, s_id, file_path, raw, rank) = r?;
+                if !seen_atomic_ids.contains(&id) {
+                    seen_atomic_ids.insert(id);
+                    seen_source_ids.insert(s_id);
+                    let excerpt = raw.map(|t| extract_passage(&t, query, 300));
                     results.push(SearchHit {
                         vault_tag: tag,
                         fact_content: content,
                         file_path,
-                        raw_excerpt: raw.map(|t| t.chars().take(300).collect()),
+                        raw_excerpt: excerpt,
                         bm25_rank: rank,
                     });
                 }
             }
+
+            // 3. FTS5 BM25 search over raw source text (sources_fts)
+            // Catches details that the LLM extraction omitted (e.g. QUARTZFOX reproduction)
+            let mut src_fts_stmt = self.conn.prepare(
+                "SELECT s.id, s.file_path, s.raw_content, bm25(sources_fts) as rank
+                 FROM sources_fts f
+                 JOIN sources s ON s.id = f.rowid
+                 WHERE sources_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2"
+            )?;
+
+            let src_rows = src_fts_stmt.query_map(params![fts_query, max_results], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?;
+
+            for r in src_rows {
+                let (s_id, file_path, raw, rank) = r?;
+                if let Some(ref text) = raw {
+                    let passage = extract_passage(text, query, 300);
+                    if !seen_source_ids.contains(&s_id) {
+                        seen_source_ids.insert(s_id);
+                        results.push(SearchHit {
+                            vault_tag: "SOURCE".to_string(),
+                            fact_content: passage.clone(),
+                            file_path,
+                            raw_excerpt: Some(passage),
+                            bm25_rank: rank + 1.0, // slight offset so atomic facts rank ahead of raw passages at equal BM25
+                        });
+                    }
+                }
+            }
         }
+
+        // 4. Final limit and ranking: strictly enforce max_results across all merged branches
+        results.sort_by(|a, b| a.bm25_rank.partial_cmp(&b.bm25_rank).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(max_results);
 
         Ok(results)
     }
@@ -347,10 +525,10 @@ impl RemainderEngine {
         use sha2::{Sha256, Digest};
         let tx = self.conn.transaction()?;
 
-        // 1. Upsert source entry with raw_content preserved
+        // 1. Upsert source entry with raw_content preserved (or keep existing if raw_content is None)
         tx.execute(
             "INSERT INTO sources (file_path, raw_content, last_shredded) VALUES (?1, ?2, CURRENT_TIMESTAMP)
-             ON CONFLICT(file_path) DO UPDATE SET raw_content = ?2, last_shredded = CURRENT_TIMESTAMP",
+             ON CONFLICT(file_path) DO UPDATE SET raw_content = COALESCE(?2, sources.raw_content), last_shredded = CURRENT_TIMESTAMP",
             params![file_path, raw_content],
         )?;
 
@@ -518,7 +696,7 @@ mod tests {
         let non_null_hash: String = conn.query_row("SELECT hash FROM atomics WHERE vault_tag = 'DATABASE'", [], |r| r.get(0))?;
 
         assert_eq!(after_count, 1, "Fact must not be lost!");
-        assert_eq!(new_version, 3, "user_version must be upgraded to 3");
+        assert_eq!(new_version, 4, "user_version must be upgraded to 4");
         assert!(!non_null_hash.is_empty(), "Hash must be populated and non-null");
 
         Ok(())
@@ -550,7 +728,7 @@ mod tests {
         let new_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
         assert_eq!(after_count, 1, "Fact without source_id must be preserved");
-        assert_eq!(new_version, 3);
+        assert_eq!(new_version, 4);
 
         Ok(())
     }
@@ -622,6 +800,83 @@ mod tests {
         let count: i64 = conn.query_row("SELECT count(*) FROM atomics", [], |r| r.get(0))?;
         assert_eq!(count, 1, "Original table records must be preserved via rollback");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_source_detail_searchable_when_omitted_from_extracted_facts() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+
+        // Document containing QUARTZFOX, but extracted atomic fact omits QUARTZFOX
+        let doc = "System Configuration Details:\n\
+                   Cluster node id: 0x4F\n\
+                   Secret key identifier: QUARTZFOX\n\
+                   Heartbeat interval: 500ms.";
+
+        engine.refresh_source_facts("secrets.txt", Some(doc), vec![
+            ("SYSTEM".into(), "Cluster node id is 0x4F and heartbeat interval is 500ms.".into()),
+        ])?;
+
+        // 1. Verify raw source is preserved exactly
+        let full_content = engine.get_source_content("secrets.txt")?;
+        assert_eq!(full_content.as_deref(), Some(doc));
+
+        // 2. Search for source-only term QUARTZFOX omitted by LLM extraction
+        let hits = engine.search("QUARTZFOX", None)?;
+        assert!(!hits.is_empty(), "QUARTZFOX must be found in raw source FTS5 index even when omitted from facts");
+        assert_eq!(hits[0].vault_tag, "SOURCE");
+        assert_eq!(hits[0].file_path, "secrets.txt");
+        assert!(hits[0].fact_content.contains("QUARTZFOX"), "Passage must contain QUARTZFOX");
+        assert!(hits[0].raw_excerpt.as_ref().unwrap().contains("QUARTZFOX"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_limit_enforcement_across_branches() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+
+        engine.refresh_source_facts("db.txt", Some("Database architecture uses WAL mode."), vec![
+            ("DATABASE".into(), "WAL mode configured.".into()),
+            ("DATABASE".into(), "Synchronous NORMAL configured.".into()),
+        ])?;
+
+        // With tag match + FTS facts match + source match, limit=1 must return EXACTLY 1 result
+        let single_hit = engine.search("DATABASE", Some(1))?;
+        assert_eq!(single_hit.len(), 1, "Limit=1 must strictly return 1 result across all branches");
+
+        let two_hits = engine.search("DATABASE", Some(2))?;
+        assert_eq!(two_hits.len(), 2, "Limit=2 must strictly return 2 results across all branches");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_backfill_existing_sources_populates_null_raw_content() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("remainder_backfill_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir)?;
+        let file_path = temp_dir.join("legacy_notes.txt");
+        let content = "Backfilled documentation containing ZEBRA_OMEGA token.";
+        std::fs::write(&file_path, content)?;
+
+        let mut engine = RemainderEngine::new(":memory:")?;
+        // Insert source row with NULL raw_content (simulating pre-v3 database state)
+        engine.conn.execute(
+            "INSERT INTO sources (file_path, raw_content) VALUES (?1, NULL)",
+            params![file_path.to_string_lossy().to_string()],
+        )?;
+
+        // Run backfill
+        let backfilled = engine.backfill_existing_sources()?;
+        assert_eq!(backfilled, 1, "Must backfill exactly 1 legacy source from disk");
+
+        // Verify raw_content is populated and indexed in sources_fts
+        let hits = engine.search("ZEBRA_OMEGA", None)?;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].fact_content.contains("ZEBRA_OMEGA"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 }

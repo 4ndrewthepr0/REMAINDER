@@ -169,6 +169,9 @@ pub fn process_inference_result(
         return Ok(InferenceOutcome::DiscardedStale);
     }
 
+    // Persist raw source content immediately so it is indexed and searchable even if LLM extraction fails or retries
+    let _ = engine.record_source_content(&file_str, &content);
+
     let current_retry = pending_files.get(&path).map(|p| p.retry_count).unwrap_or(0);
 
     match res {
@@ -293,18 +296,32 @@ fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> 
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "tools": [{
-                            "name": "query_bunker",
-                            "description": "Retrieves technical facts from the local REMAINDER vault using natural-language search (BM25) or category tag lookup, with source file provenance and context excerpts.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "query": { "type": "string", "description": "Natural-language query (e.g. 'How do we authorize RPC calls?') or category tag (e.g. 'DATABASE', 'AUTH')" },
-                                    "tag": { "type": "string", "description": "Optional category tag (backward compatibility)" }
-                                },
-                                "required": ["query"]
+                        "tools": [
+                            {
+                                "name": "query_bunker",
+                                "description": "Retrieves technical facts and matching source passages from the local REMAINDER vault using natural-language search (BM25) or category tag lookup, with source file provenance and context excerpts.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": { "type": "string", "description": "Natural-language query or category tag" },
+                                        "tag": { "type": "string", "description": "Optional category tag (backward compatibility)" },
+                                        "limit": { "type": "integer", "description": "Maximum number of results to return (default 20)" }
+                                    },
+                                    "required": ["query"]
+                                }
+                            },
+                            {
+                                "name": "get_source",
+                                "description": "Retrieves the full preserved verbatim source text for a file path from the REMAINDER vault.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string", "description": "Relative or absolute file path" }
+                                    },
+                                    "required": ["path"]
+                                }
                             }
-                        }]
+                        ]
                     }
                 }))
             }
@@ -317,8 +334,24 @@ fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> 
                     .and_then(|t| t.as_str())
                     .unwrap_or("");
 
-                let text = if name == "query_bunker" {
-                    match engine.search(query, Some(20)) {
+                let text = if name == "get_source" {
+                    let path = params
+                        .and_then(|p| p.get("arguments"))
+                        .and_then(|a| a.get("path"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    match engine.get_source_content(path) {
+                        Ok(Some(content)) => content,
+                        Ok(None) => format!("[BUNKER] Source not found or has no recorded content: {}", path),
+                        Err(e) => format!("Error retrieving source: {}", e),
+                    }
+                } else if name == "query_bunker" {
+                    let limit = params
+                        .and_then(|p| p.get("arguments"))
+                        .and_then(|a| a.get("limit"))
+                        .and_then(|l| l.as_u64())
+                        .map(|l| l as usize);
+                    match engine.search(query, limit) {
                         Ok(hits) if !hits.is_empty() => {
                             hits.iter()
                                 .map(|h| {
@@ -383,23 +416,47 @@ async fn main() -> anyhow::Result<()> {
     if args.len() > 1 && args[1] == "mcp" {
         if args.len() > 2 && args[2] == "list" {
             println!("{}", json!({
-                "tools": [{
-                    "name": "query_bunker",
-                    "description": "Retrieves technical facts from the local REMAINDER vault using natural-language search (BM25) or category tag lookup, with source file provenance and context excerpts.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string", "description": "Natural-language query or category tag" },
-                            "tag": { "type": "string", "description": "Optional category tag filter" }
-                        },
-                        "required": ["query"]
+                "tools": [
+                    {
+                        "name": "query_bunker",
+                        "description": "Retrieves technical facts and matching source passages from the local REMAINDER vault using natural-language search (BM25) or category tag lookup, with source file provenance and context excerpts.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string", "description": "Natural-language query or category tag" },
+                                "tag": { "type": "string", "description": "Optional category tag filter" },
+                                "limit": { "type": "integer", "description": "Maximum number of results to return (default 20)" }
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "get_source",
+                        "description": "Retrieves the full preserved verbatim source text for a file path from the REMAINDER vault.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Relative or absolute file path" }
+                            },
+                            "required": ["path"]
+                        }
                     }
-                }]
+                ]
             }));
             return Ok(());
         } else if args.len() > 3 && args[2] == "call" {
+            if args[3] == "source" || args[3] == "get_source" {
+                let path = args.get(4).map(|s| s.as_str()).unwrap_or("");
+                match engine.get_source_content(path)? {
+                    Some(content) => println!("{}", json!({ "content": [{ "type": "text", "text": content }] })),
+                    None => println!("{}", json!({ "content": [{ "type": "text", "text": format!("Source not found: {}", path) }] })),
+                }
+                return Ok(());
+            }
+
             let query = &args[3];
-            let hits = engine.search(query, Some(20))?;
+            let limit = args.get(4).and_then(|s| s.parse::<usize>().ok()).or(Some(20));
+            let hits = engine.search(query, limit)?;
             if !hits.is_empty() {
                 let combined = hits.iter()
                     .map(|h| {
@@ -426,7 +483,8 @@ async fn main() -> anyhow::Result<()> {
     // --- CLI QUERY MODE (Natural-language & Multi-fact retrieval) ---
     if args.len() > 2 && args[1] == "query" {
         let query = &args[2];
-        let hits = engine.search(query, Some(20))?;
+        let limit = args.get(3).and_then(|s| s.parse::<usize>().ok()).or(Some(20));
+        let hits = engine.search(query, limit)?;
         if hits.is_empty() {
             println!("[BUNKER] No records found for query: {}", query);
         } else {
@@ -439,6 +497,16 @@ async fn main() -> anyhow::Result<()> {
                     println!("         Context: \"{}\"", preview);
                 }
             }
+        }
+        return Ok(());
+    }
+
+    // --- CLI FULL-SOURCE RETRIEVAL MODE ---
+    if args.len() > 2 && args[1] == "source" {
+        let path = &args[2];
+        match engine.get_source_content(path)? {
+            Some(content) => println!("{}", content),
+            None => println!("[BUNKER] Source not found or has no recorded content: {}", path),
         }
         return Ok(());
     }
@@ -600,6 +668,10 @@ async fn main() -> anyhow::Result<()> {
 
                     let input_hash = compute_file_hash(&content);
                     in_flight.insert(path.clone());
+
+                    // Immediately persist raw source content so it is indexed and searchable in sources_fts
+                    // even before LLM inference completes or if inference encounters an error.
+                    let _ = engine.record_source_content(&file_str, &content);
 
                     println!("\n[GHOST] Ripe file ready: {}. Dispatching Llama 3.1 background inference...", file_name);
                     let shredder_clone = shredder.clone();
@@ -859,7 +931,7 @@ mod tests {
         assert_eq!(hits[0].vault_tag, "ARCHITECTURE");
         assert!(hits[0].fact_content.contains("Rejected MongoDB"));
         assert_eq!(hits[0].file_path, doc_path.to_string_lossy());
-        assert!(hits[0].raw_excerpt.as_ref().unwrap().contains("Architecture Decision Record: Persistence Layer"));
+        assert!(hits[0].raw_excerpt.as_ref().unwrap().contains("MongoDB was rejected"));
 
         // 2. Exact tag lookup query ('DATABASE') gets highest priority boost (-100.0 rank)
         let tag_hits = engine.search("DATABASE", None)?;
@@ -867,6 +939,52 @@ mod tests {
         assert_eq!(tag_hits[0].vault_tag, "DATABASE");
         assert_eq!(tag_hits[0].bm25_rank, -100.0, "Exact tag matches receive priority boost");
         assert!(tag_hits[0].fact_content.contains("PostgreSQL 16"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_production_failed_extraction_preserves_raw_source_content() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("remainder_failed_ext_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let doc_path = temp_dir.join("critical_spec.md");
+        let raw_text = "Mission Critical Specification: System uses KRYPTON_ALPHA token.";
+        std::fs::write(&doc_path, raw_text)?;
+
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
+        let mut pending_files = HashMap::new();
+        let mut in_flight = HashSet::new();
+
+        let input_hash = compute_file_hash(raw_text);
+        // Simulate LLM failure (e.g. Ollama 500 or timeout)
+        let llm_err = Err(anyhow::anyhow!("Ollama connection refused"));
+
+        let outcome = process_inference_result(
+            doc_path.clone(),
+            input_hash,
+            llm_err,
+            &mut engine,
+            &mut pending_files,
+            &mut in_flight,
+            1,
+            Some(raw_text.to_string()),
+        )?;
+
+        // Outcome is ScheduledRetry, but raw source must already be persisted and searchable!
+        assert_eq!(outcome, InferenceOutcome::ScheduledRetry { attempt: 1, delay: Duration::from_secs(1) });
+
+        // 1. Verify get_source_content retrieves the full raw content immediately
+        let retrieved = engine.get_source_content(doc_path.to_str().unwrap())?;
+        assert_eq!(retrieved.as_deref(), Some(raw_text));
+
+        // 2. Verify search immediately finds KRYPTON_ALPHA from sources_fts
+        let hits = engine.search("KRYPTON_ALPHA", None)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].vault_tag, "SOURCE");
+        assert!(hits[0].fact_content.contains("KRYPTON_ALPHA"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
