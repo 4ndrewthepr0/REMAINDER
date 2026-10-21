@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde_json::json;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Shredder {
@@ -9,13 +10,19 @@ pub struct Shredder {
 }
 
 impl Shredder {
+    #[allow(dead_code)]
     pub fn new(model: &str) -> Self {
         Self::with_base_url(model, "http://localhost:11434")
     }
 
     pub fn with_base_url(model: &str, base_url: &str) -> Self {
+        Self::with_timeout(model, base_url, Duration::from_secs(120))
+    }
+
+    pub fn with_timeout(model: &str, base_url: &str, timeout: Duration) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder().connect_timeout(Duration::from_secs(5))
+                .timeout(timeout).build().expect("HTTP client configuration"),
             model: model.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
@@ -24,11 +31,22 @@ impl Shredder {
     /// Takes raw text and extracts all distilled 'Atomic Facts' via Local LLM
     pub async fn extract_atomic(&self, input: &str) -> anyhow::Result<String> {
         let prompt = format!(
-            "### Instruction: \
-            Analyze the following input and extract all distinct technical facts, architectural decisions, and operational constraints. \
-            Output each fact on its own line in the exact format: [CATEGORY_TAG] -> FACT_OR_DECISION. \
-            Do not condense multiple distinct decisions into a single line. No preamble, no conversational fluff, no bullet numbers. \
-            \nInput: {}\n\n### Response:", 
+            "You are a strict data extraction engine for a developer knowledge vault.\n\
+            Analyze the following document and extract all distinct technical facts, architectural decisions, and operational constraints.\n\
+            Output each fact on its own line in the exact format:\n\
+            [TAG] -> Complete standalone proposition sentence.\n\n\
+            Examples:\n\
+            [DATABASE] -> The production database is PostgreSQL 16.\n\
+            [CACHE] -> The session cache is Dragonfly with a 20-minute expiration.\n\
+            [BACKUP] -> Restore drills run every month against an isolated environment.\n\
+            [ROLLBACK] -> The rollback authorization codeword is MARIGOLDANCHOR.\n\n\
+            Rules:\n\
+            1. Output ONLY lines matching: [TAG] -> PROPOSITION\n\
+            2. Do NOT include markdown code blocks, numbers, bullet markers, introductions, or pleasantries.\n\
+            3. Every fact must be a complete, self-contained statement.\n\
+            4. Preserve exact version numbers, codewords, durations, and metrics verbatim.\n\n\
+            Input:\n{}\n\n\
+            Propositions:\n", 
             input
         );
 
@@ -37,7 +55,10 @@ impl Shredder {
             .json(&json!({
                 "model": self.model,
                 "prompt": prompt,
-                "stream": false
+                "stream": false,
+                "options": {
+                    "temperature": 0.0
+                }
             }))
             .send()
             .await?;

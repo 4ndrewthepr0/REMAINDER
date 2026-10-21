@@ -1,4 +1,6 @@
 /target
+remainder.db
 remainder.db-wal
 remainder.db-shm
+*.bak
 *.log
