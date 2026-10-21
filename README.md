@@ -4,7 +4,7 @@
 > Zero Python. Zero virtualenvs. Sub-second retrieval. Native MCP.
 
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![MCP](https://img.shields.io/badge/protocol-Model_Context_Protocol-purple.svg)](https://modelcontextprotocol.io/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
@@ -125,4 +125,5 @@ REMAINDER uses a three-tier storage engine:
 
 ## License
 
-MIT License. Built by **4ndrewthepr0**.
+GNU General Public License v3.0 (GPL-3.0). See [LICENSE](LICENSE) for details. Built by **4ndrewthepr0**.
+
