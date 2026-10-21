@@ -2,6 +2,9 @@
 name = "remainder"
 version = "0.2.0"
 edition = "2021"
+license = "GPL-3.0-only"
+description = "The Industrial Memory Bunker for AI Agents. Local-first, zero Python dependencies, sub-second retrieval, native MCP support."
+repository = "https://github.com/4ndrewthepr0/REMAINDER"
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
