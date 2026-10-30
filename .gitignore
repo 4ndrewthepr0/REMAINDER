@@ -4,3 +4,4 @@ remainder.db-wal
 remainder.db-shm
 *.bak
 *.log
+vault_chats/

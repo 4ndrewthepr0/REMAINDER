@@ -614,7 +614,7 @@ pub fn parse_facts(output: &str) -> anyhow::Result<Vec<(String, String)>> {
     Ok(facts)
 }
 
-pub fn process_mcp_message(line: &str, engine: &engine::RemainderEngine) -> Option<serde_json::Value> {
+pub fn process_mcp_message(line: &str, engine: &mut engine::RemainderEngine) -> Option<serde_json::Value> {
     if line.trim().is_empty() {
         return None;
     }
@@ -673,6 +673,18 @@ pub fn process_mcp_message(line: &str, engine: &engine::RemainderEngine) -> Opti
                                 },
                                 "required": ["path"]
                             }
+                        },
+                        {
+                            "name": "save_memory",
+                            "description": "Persists an atomic fact, architectural decision, or project note directly into the REMAINDER vault with instant FTS5 indexing.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "fact": { "type": "string", "description": "The fact, decision, or note to record" },
+                                    "tag": { "type": "string", "description": "Category tag for the fact (e.g. ARCH, AUTH, DATABASE, DECISION, NOTE)" }
+                                },
+                                "required": ["fact"]
+                            }
                         }
                     ]
                 }
@@ -723,6 +735,26 @@ pub fn process_mcp_message(line: &str, engine: &engine::RemainderEngine) -> Opti
                     Ok(_) => format!("[BUNKER] No records found for query: {}", query),
                     Err(e) => format!("Error querying bunker: {}", e),
                 }
+            } else if name == "save_memory" || name == "remember" || name == "mempalace_add" {
+                let fact = params
+                    .and_then(|p| p.get("arguments"))
+                    .and_then(|a| a.get("fact").or_else(|| a.get("content")).or_else(|| a.get("text")).or_else(|| a.get("memory")))
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("");
+                let tag = params
+                    .and_then(|p| p.get("arguments"))
+                    .and_then(|a| a.get("tag").or_else(|| a.get("category")))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("NOTE");
+
+                if fact.trim().is_empty() {
+                    "[BUNKER] Error: fact argument cannot be empty.".to_string()
+                } else {
+                    match engine.save_memory_fact(tag, fact) {
+                        Ok(id) => format!("[BUNKER] Memory committed successfully (ID: {}, Tag: [{}]). Fact is now persistent and searchable via BM25.", id, tag.trim().to_uppercase()),
+                        Err(e) => format!("[BUNKER] Error saving memory: {}", e),
+                    }
+                }
             } else {
                 format!("Unknown tool: {}", name)
             };
@@ -749,7 +781,7 @@ pub fn process_mcp_message(line: &str, engine: &engine::RemainderEngine) -> Opti
     }
 }
 
-fn run_mcp_stdio_server(engine: &engine::RemainderEngine) -> anyhow::Result<()> {
+fn run_mcp_stdio_server(engine: &mut engine::RemainderEngine) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let reader = stdin.lock();
@@ -789,11 +821,13 @@ USAGE:
 
 COMMANDS:
     (default)            Start the Ghost Watcher daemon in current directory
+    init [PATH]          Initialize bunker in PATH, index files, and print AI/MCP configurations
+    mine [PATH]          Alias for 'sweep' (ingest and index project files into bunker)
+    sweep [PATH] [--extract] One-shot bulk scan and index (pass --extract for LLM fact extraction)
     watch [PATH]         Start the Ghost Watcher daemon monitoring PATH (default: .)
     query <QUERY> [LIMIT] Search atomic facts and source passages (BM25 + Tag lookup)
     source <PATH>        Retrieve preserved verbatim raw source content for PATH
     stats                Display vault diagnostics, fact freshness, and storage health
-    sweep [PATH] [--extract] One-shot bulk scan and index (pass --extract for LLM fact extraction)
     repair               Run SQLite integrity checks and rebuild FTS5 search indices
     mcp                  Run Model Context Protocol (MCP) server over Stdio
     mcp list             List available MCP tools as JSON
@@ -854,7 +888,70 @@ ENVIRONMENT VARIABLES:
                     return Ok(());
                 }
             }
-            "sweep" => {
+            "init" => {
+                let target_dir = if args.len() > 2 && !args[2].starts_with('-') {
+                    PathBuf::from(&args[2])
+                } else {
+                    std::env::current_dir()?
+                };
+                let target_dir = if target_dir.is_relative() {
+                    std::env::current_dir()?.join(&target_dir)
+                } else {
+                    target_dir
+                };
+                if !target_dir.exists() {
+                    std::fs::create_dir_all(&target_dir)?;
+                }
+                let target_dir = target_dir.canonicalize().unwrap_or(target_dir);
+                let target_db = target_dir.join("remainder.db");
+                let target_db_str = target_db.to_string_lossy().to_string();
+
+                println!("============================================================");
+                println!("REMAINDER: Initializing Memory Bunker in {}", target_dir.display());
+                println!("============================================================");
+
+                let mut local_engine = engine::RemainderEngine::new(&target_db_str)?;
+                let stats = local_engine.get_stats()?;
+                println!("  [OK] Vault Database : {}", target_db.display());
+                println!("  [OK] Schema Version : v{} (B-tree integrity verified)", stats.schema_version);
+
+                println!("  [OK] Scanning and indexing project files into FTS5...");
+                let mut pending = HashMap::new();
+                reconcile_project(&target_dir, &mut local_engine, &mut pending, false).await?;
+                let _ = local_engine.checkpoint();
+                println!("  [OK] Initial indexing complete. Source files indexed into FTS5.");
+
+                let current_exe = std::env::current_exe()
+                    .unwrap_or_else(|_| PathBuf::from("remainder"))
+                    .display()
+                    .to_string();
+                let escaped_exe = current_exe.replace('\\', "\\\\");
+                let escaped_db = target_db.display().to_string().replace('\\', "\\\\");
+
+                println!("\n  CONNECT TO YOUR AI TOOLS (MCP CONFIGURATION):");
+                println!("  ------------------------------------------------------------");
+                println!("  For Claude Desktop (add to claude_desktop_config.json):");
+                println!(r#"  {{
+    "mcpServers": {{
+      "remainder": {{
+        "command": "{}",
+        "args": ["mcp"],
+        "env": {{
+          "REMAINDER_DB": "{}"
+        }}
+      }}
+    }}
+  }}"#, escaped_exe, escaped_db);
+
+                println!("\n  For Cursor / Windsurf / VS Code (add in Settings -> MCP):");
+                println!("    Command : {}", current_exe);
+                println!("    Args    : mcp");
+                println!("    Env     : REMAINDER_DB={}", target_db.display());
+                println!("============================================================");
+                println!("Bunker ready! Run 'remainder watch .' for background sync.");
+                return Ok(());
+            }
+            "sweep" | "mine" => {
                 let mut extract_mode = false;
                 let mut target_path: Option<PathBuf> = None;
                 for arg in args.iter().skip(2) {
@@ -971,6 +1068,18 @@ ENVIRONMENT VARIABLES:
                                     },
                                     "required": ["path"]
                                 }
+                            },
+                            {
+                                "name": "save_memory",
+                                "description": "Persists an atomic fact, architectural decision, or project note directly into the REMAINDER vault with instant FTS5 indexing.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "fact": { "type": "string", "description": "The fact, decision, or note to record" },
+                                        "tag": { "type": "string", "description": "Category tag for the fact (e.g. ARCH, AUTH, DATABASE, DECISION, NOTE)" }
+                                    },
+                                    "required": ["fact"]
+                                }
                             }
                         ]
                     }));
@@ -982,6 +1091,12 @@ ENVIRONMENT VARIABLES:
                             Some(content) => println!("{}", json!({ "content": [{ "type": "text", "text": content }] })),
                             None => println!("{}", json!({ "content": [{ "type": "text", "text": format!("Source not found: {}", path) }] })),
                         }
+                        return Ok(());
+                    } else if args[3] == "save" || args[3] == "save_memory" || args[3] == "remember" {
+                        let tag = args.get(4).map(|s| s.as_str()).unwrap_or("NOTE");
+                        let fact = args.get(5).map(|s| s.as_str()).unwrap_or("");
+                        let id = engine.save_memory_fact(tag, fact)?;
+                        println!("{}", json!({ "content": [{ "type": "text", "text": format!("[BUNKER] Saved memory ID: {}", id) }] }));
                         return Ok(());
                     }
 
@@ -1007,7 +1122,7 @@ ENVIRONMENT VARIABLES:
                     }
                     return Ok(());
                 } else {
-                    return run_mcp_stdio_server(&engine);
+                    return run_mcp_stdio_server(&mut engine);
                 }
             }
             "watch" => {
@@ -1550,9 +1665,9 @@ mod tests {
 
     #[test]
     fn test_mcp_initialize_handshake() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must return response for initialize");
+        let resp = process_mcp_message(req, &mut engine).expect("Must return response for initialize");
         
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
@@ -1564,9 +1679,9 @@ mod tests {
 
     #[test]
     fn test_mcp_ping_returns_empty_result() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","id":"ping-42","method":"ping"}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must return response for ping");
+        let resp = process_mcp_message(req, &mut engine).expect("Must return response for ping");
         
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], "ping-42");
@@ -1576,25 +1691,26 @@ mod tests {
 
     #[test]
     fn test_mcp_notifications_initialized_yields_none() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        let resp = process_mcp_message(req, &engine);
+        let resp = process_mcp_message(req, &mut engine);
         assert!(resp.is_none(), "Notifications must not yield a response envelope");
         Ok(())
     }
 
     #[test]
     fn test_mcp_tools_list_registers_query_bunker_and_get_source() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","id":100,"method":"tools/list"}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must return tools list");
+        let resp = process_mcp_message(req, &mut engine).expect("Must return tools list");
 
         let tools = resp["result"]["tools"].as_array().expect("Tools must be array");
-        assert_eq!(tools.len(), 2, "Must register exactly query_bunker and get_source");
+        assert_eq!(tools.len(), 3, "Must register query_bunker, get_source, and save_memory");
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"query_bunker"));
         assert!(names.contains(&"get_source"));
+        assert!(names.contains(&"save_memory"));
         Ok(())
     }
 
@@ -1606,7 +1722,7 @@ mod tests {
         ])?;
 
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_bunker","arguments":{"query":"CACHE"}}}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must process query_bunker call");
+        let resp = process_mcp_message(req, &mut engine).expect("Must process query_bunker call");
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[BUNKER] [CACHE] -> Redis 7 with LRU eviction policy."));
@@ -1621,7 +1737,7 @@ mod tests {
         engine.refresh_source_facts("s2.txt", Some("doc 2"), vec![("TAG".into(), "Fact 2".into())])?;
 
         let req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_bunker","arguments":{"query":"TAG","limit":1}}}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must handle limit in query_bunker");
+        let resp = process_mcp_message(req, &mut engine).expect("Must handle limit in query_bunker");
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         // Since limit=1, there should be exactly one [BUNKER] tag
@@ -1632,9 +1748,9 @@ mod tests {
 
     #[test]
     fn test_mcp_tools_call_query_bunker_no_records() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_bunker","arguments":{"query":"NON_EXISTENT"}}}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must handle empty query");
+        let resp = process_mcp_message(req, &mut engine).expect("Must handle empty query");
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[BUNKER] No records found for query: NON_EXISTENT"));
@@ -1648,7 +1764,7 @@ mod tests {
         engine.refresh_source_facts("lib.rs", Some(source_code), vec![])?;
 
         let req = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_source","arguments":{"path":"lib.rs"}}}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must handle get_source");
+        let resp = process_mcp_message(req, &mut engine).expect("Must handle get_source");
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, source_code);
@@ -1657,9 +1773,9 @@ mod tests {
 
     #[test]
     fn test_mcp_tools_call_get_source_not_found() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_source","arguments":{"path":"missing.rs"}}}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must handle missing source");
+        let resp = process_mcp_message(req, &mut engine).expect("Must handle missing source");
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("[BUNKER] Source not found or has no recorded content: missing.rs"));
@@ -1667,10 +1783,28 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_tools_call_save_memory_success() -> anyhow::Result<()> {
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
+        let req = r#"{"jsonrpc":"2.0","id":88,"method":"tools/call","params":{"name":"save_memory","arguments":{"tag":"DATABASE","fact":"Enforce WAL mode and NORMAL synchronous"}}}"#;
+        let resp = process_mcp_message(req, &mut engine).expect("Must handle save_memory");
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[BUNKER] Memory committed successfully"), "Got: {}", text);
+        assert!(text.contains("Tag: [DATABASE]"));
+
+        // Query bunker must now immediately find it
+        let query_req = r#"{"jsonrpc":"2.0","id":89,"method":"tools/call","params":{"name":"query_bunker","arguments":{"query":"WAL mode"}}}"#;
+        let query_resp = process_mcp_message(query_req, &mut engine).expect("Must handle query");
+        let query_text = query_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(query_text.contains("[DATABASE] -> Enforce WAL mode and NORMAL synchronous"));
+        Ok(())
+    }
+
+    #[test]
     fn test_mcp_tools_call_unknown_tool() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"super_tool","arguments":{}}}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must return response for unknown tool");
+        let resp = process_mcp_message(req, &mut engine).expect("Must return response for unknown tool");
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "Unknown tool: super_tool");
@@ -1679,9 +1813,9 @@ mod tests {
 
     #[test]
     fn test_mcp_unknown_method_returns_32601() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
         let req = r#"{"jsonrpc":"2.0","id":7,"method":"unsupported_method"}"#;
-        let resp = process_mcp_message(req, &engine).expect("Must return error response for unknown method");
+        let resp = process_mcp_message(req, &mut engine).expect("Must return error response for unknown method");
 
         assert_eq!(resp["error"]["code"], -32601);
         assert_eq!(resp["error"]["message"], "Method not found");
@@ -1690,10 +1824,10 @@ mod tests {
 
     #[test]
     fn test_mcp_malformed_json_and_empty_line_ignored() -> anyhow::Result<()> {
-        let engine = engine::RemainderEngine::new(":memory:")?;
-        assert!(process_mcp_message("", &engine).is_none());
-        assert!(process_mcp_message("   \n", &engine).is_none());
-        assert!(process_mcp_message("Not a valid json string {", &engine).is_none());
+        let mut engine = engine::RemainderEngine::new(":memory:")?;
+        assert!(process_mcp_message("", &mut engine).is_none());
+        assert!(process_mcp_message("   \n", &mut engine).is_none());
+        assert!(process_mcp_message("Not a valid json string {", &mut engine).is_none());
         Ok(())
     }
 

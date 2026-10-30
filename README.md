@@ -39,41 +39,38 @@
 ## Quickstart
 
 ### 1. Download & Install
-Download the compiled `remainder.exe` from the latest release, or build from source:
+
+**One-line Windows Install (PowerShell):**
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+Or build from source with Cargo:
 ```bash
 cargo build --release
 ```
 
-### 2. Index Your Codebase or Project
-Run a quick sweep of your project files:
-```bash
-# Fast passage-level indexing
-remainder sweep .
+Place `remainder.exe` (or `remainder` on Linux/macOS) in your `PATH`.
 
-# Optional: Deep extraction with local Ollama LLM
-remainder sweep . --extract
+### 2. Initialize Your Project (3-Step Setup)
+
+Navigate to any project directory:
+```bash
+cd ~/projects/my-app
+
+# Step 1: Initialize vault & generate MCP configuration
+remainder init .
+
+# Step 2: Ingest ("mine") project codebase into FTS5
+remainder mine .
+
+# (Optional: Deep extraction with local Ollama LLM)
+remainder mine . --extract
 ```
 
-### 3. Query Your Vault
-```bash
-remainder query "What is the token budget policy?" 5
-```
+### 3. Connect to Your AI Tool (Claude, Cursor, Windsurf)
 
-### 4. Background Ghost Watcher Daemon
-Keep memory synchronized with file system changes in real time:
-```bash
-remainder watch .
-```
-
----
-
-## Native MCP Integration
-
-REMAINDER speaks the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) natively over `stdio`.
-
-### Setup with Claude Desktop / Cursor / Windsurf
-
-Add the following to your `claude_desktop_config.json` or Cursor MCP settings:
+`remainder init` automatically prints your customized MCP config. Simply add it to `claude_desktop_config.json` or Cursor settings:
 
 ```json
 {
@@ -89,11 +86,23 @@ Add the following to your `claude_desktop_config.json` or Cursor MCP settings:
 }
 ```
 
+### 4. Background Ghost Watcher Daemon
+Keep memory synchronized with file system changes in real time:
+```bash
+remainder watch .
+```
+
+---
+
+## Native MCP Integration
+
+REMAINDER speaks the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) natively over `stdio`.
+
 ### Available MCP Tools
 
-* `query_memory(query, limit)`: Search atomic facts and relevant passages by keyword density & BM25 ranking.
+* `query_bunker(query, limit)`: Search atomic facts and relevant passages by keyword density & BM25 ranking.
 * `get_source(path)`: Retrieve the exact, unmodified raw source text for a tracked file.
-* `vault_stats()`: Check memory health, indexed file counts, chunk totals, and database integrity.
+* `save_memory(fact, tag)`: Persist an atomic proposition or architectural decision directly to the bunker from within chat.
 
 ---
 
@@ -101,11 +110,14 @@ Add the following to your `claude_desktop_config.json` or Cursor MCP settings:
 
 ```
 COMMANDS:
+    (default)            Start the Ghost Watcher daemon in current directory
+    init [PATH]          Initialize bunker in PATH, index files, and print AI/MCP configurations
+    mine [PATH]          Alias for 'sweep' (ingest and index project files into bunker)
+    sweep [PATH] [--extract] One-shot bulk scan and index (pass --extract for LLM fact extraction)
     watch [PATH]         Start the Ghost Watcher daemon monitoring PATH (default: .)
-    query <QUERY> [LIMIT] Search atomic facts and source passages
-    source <PATH>        Retrieve preserved verbatim raw source content
-    stats                Display vault diagnostics and storage health
-    sweep [PATH]         One-shot bulk scan and index (pass --extract for LLM fact extraction)
+    query <QUERY> [LIMIT] Search atomic facts and source passages (BM25 + Tag lookup)
+    source <PATH>        Retrieve preserved verbatim raw source content for PATH
+    stats                Display vault diagnostics, fact freshness, and storage health
     repair               Run SQLite integrity checks and rebuild FTS5 search indices
     mcp                  Run Model Context Protocol (MCP) server over Stdio
     mcp list             List available MCP tools as JSON

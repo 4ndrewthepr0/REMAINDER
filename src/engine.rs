@@ -1255,6 +1255,75 @@ impl RemainderEngine {
         Ok(inserted)
     }
 
+    /// Persists a standalone atomic memory fact directly into the bunker (e.g. from an AI agent or chat session).
+    /// Ensures source tracking for audit provenance, computes content hash for deduplication, and
+    /// immediately triggers FTS5 indexing.
+    pub fn save_memory_fact(&mut self, tag: &str, content: &str) -> anyhow::Result<i64> {
+        use sha2::{Sha256, Digest};
+        let tag_clean = if tag.trim().is_empty() {
+            "NOTE".to_string()
+        } else {
+            tag.trim().to_uppercase()
+        };
+        let content_clean = content.trim();
+        if content_clean.is_empty() {
+            anyhow::bail!("Memory content cannot be empty");
+        }
+
+        let source_path = "__chat_memory";
+        let tx = self.conn.transaction()?;
+
+        // 1. Ensure source entry exists for chat memories
+        tx.execute(
+            "INSERT INTO sources (file_path, raw_content, last_shredded, observed_at, facts_current)
+             VALUES (?1, '[AUTONOMOUS AGENT CHAT MEMORY PROPOSITIONS]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+             ON CONFLICT(file_path) DO UPDATE SET observed_at = CURRENT_TIMESTAMP, facts_current = 1",
+            params![source_path],
+        )?;
+
+        let source_id: i64 = tx.query_row(
+            "SELECT id FROM sources WHERE file_path = ?1",
+            params![source_path],
+            |row| row.get(0),
+        )?;
+
+        // 2. Compute composite hash for deduplication
+        let mut hasher = Sha256::new();
+        hasher.update(tag_clean.as_bytes());
+        hasher.update(b":");
+        hasher.update(content_clean.as_bytes());
+        let hash_hex = hex::encode(hasher.finalize());
+
+        // 3. Upsert into atomics (FTS5 triggers will automatically sync to atomics_fts)
+        tx.execute(
+            "INSERT INTO atomics (source_id, vault_tag, fact_content, hash)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(source_id, hash) DO UPDATE SET fact_content = excluded.fact_content",
+            params![source_id, tag_clean, content_clean, hash_hex],
+        )?;
+
+        let atomic_id: i64 = tx.query_row(
+            "SELECT id FROM atomics WHERE source_id = ?1 AND hash = ?2",
+            params![source_id, hash_hex],
+            |row| row.get(0),
+        )?;
+
+        // 4. If embedder is configured, embed this atomic fact as well
+        if let Some(ref emb) = self.embedder {
+            let text = format!("[{}] {}", tag_clean, content_clean);
+            if let Ok(vec) = emb.embed(&text) {
+                let bytes = f32_slice_to_bytes(&vec);
+                let _ = tx.execute(
+                    "INSERT OR REPLACE INTO atomics_embeddings (atomic_id, embedding) VALUES (?1, ?2)",
+                    params![atomic_id, bytes],
+                );
+            }
+        }
+
+        tx.commit()?;
+        Ok(atomic_id)
+    }
+
     /// Removes a source or all nested sources in a directory using exact path component hierarchy.
     /// Immune to SQL LIKE wildcard collisions (e.g. 'arch_notes' will never match 'archXnotes' or 'arch_notes_extra').
     pub fn remove_source_or_prefix(&mut self, path_str: &str) -> anyhow::Result<usize> {
@@ -2319,6 +2388,40 @@ mod tests {
         assert!(passage.contains("token scheduling budget"), "Must anchor on density cluster, got: {}", passage);
         assert!(passage.contains("chunked prefill"));
         assert!(!passage.starts_with("What is this issue tracker"), "Must NOT anchor on preamble stopword 'What'");
+    }
+
+    #[test]
+    fn test_save_memory_fact_immediate_search_and_deduplication() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+
+        // 1. Save autonomous fact
+        let id1 = engine.save_memory_fact("AUTH", "Enforce Ed25519 signatures for all internal microservice calls")?;
+        assert!(id1 > 0);
+
+        // 2. Immediate BM25 natural language search must find it
+        let hits = engine.search("What signature algorithm is used for microservices?", Some(5))?;
+        assert!(!hits.is_empty(), "Must find freshly saved memory fact");
+        assert_eq!(hits[0].vault_tag, "AUTH");
+        assert!(hits[0].fact_content.contains("Ed25519"));
+        assert_eq!(hits[0].file_path, "__chat_memory");
+
+        // 3. Search by tag must find it
+        let tag_hits = engine.get_facts_by_tag("AUTH", Some(5))?;
+        assert_eq!(tag_hits.len(), 1);
+        assert!(tag_hits[0].contains("Ed25519"));
+
+        // 4. Duplicate save should be idempotent
+        let id2 = engine.save_memory_fact("AUTH", "Enforce Ed25519 signatures for all internal microservice calls")?;
+        assert_eq!(id1, id2, "Idempotent save must return existing atomic ID");
+
+        let tag_hits2 = engine.get_facts_by_tag("AUTH", Some(5))?;
+        assert_eq!(tag_hits2.len(), 1, "Duplicate fact must not create second row");
+
+        // 5. Vault integrity must pass
+        let stats = engine.get_stats()?;
+        assert!(stats.integrity_ok);
+        assert_eq!(stats.current_facts, 1);
+        Ok(())
     }
 }
 
