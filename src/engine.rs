@@ -2,9 +2,89 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use std::collections::{HashMap, HashSet};
 
+pub fn excerpt_char_limit() -> usize {
+    std::env::var("REMAINDER_EXCERPT_CHARS").ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (64..=16000).contains(value)).unwrap_or(1000)
+}
+
+// Rank fusion must have a total order: HashMap iteration is randomized and
+// equal scores otherwise change the selected evidence across identical calls.
+fn fused_order(
+    a: (f64, Option<usize>, Option<usize>, &str, &str),
+    b: (f64, Option<usize>, Option<usize>, &str, &str),
+) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0)
+        .then_with(|| a.1.unwrap_or(usize::MAX).cmp(&b.1.unwrap_or(usize::MAX)))
+        .then_with(|| a.2.unwrap_or(usize::MAX).cmp(&b.2.unwrap_or(usize::MAX)))
+        .then_with(|| a.3.cmp(b.3))
+        .then_with(|| a.4.cmp(b.4))
+}
+
 pub struct RemainderEngine {
     pub conn: Connection,
     pub embedder: Option<std::sync::Arc<crate::embedder::Embedder>>,
+    pub reranker: Option<std::sync::Arc<crate::reranker::CrossEncoder>>,
+}
+
+/// Replace the searchable passages and dense vectors for a source together.
+/// Inference dominates ingestion cost, so evaluate passages in small batches
+/// while retaining a single-passage fallback for unusual model input shapes.
+fn replace_source_indexes(
+    tx: &rusqlite::Transaction<'_>, source_id: i64, raw_content: &str,
+    embedder: Option<&crate::embedder::Embedder>,
+) -> anyhow::Result<()> {
+    let chunks = source_chunks_for_indexing(raw_content, embedder)?;
+    tx.execute("DELETE FROM source_chunks_fts WHERE source_id = ?1", params![source_id])?;
+    {
+        let mut insert_fts = tx.prepare_cached(
+            "INSERT INTO source_chunks_fts (chunk_text, source_id, chunk_index) VALUES (?1, ?2, ?3)"
+        )?;
+        for (idx, chunk) in chunks.iter().enumerate() {
+            insert_fts.execute(params![chunk, source_id, idx as i64])?;
+        }
+    }
+    // Changed text must never retain vectors from the prior version, even if
+    // the model/runtime is unavailable during this indexing operation.
+    tx.execute("DELETE FROM source_embeddings WHERE source_id = ?1", params![source_id])?;
+    if let Some(emb) = embedder {
+        let mut insert_dense = tx.prepare_cached(
+            "INSERT OR REPLACE INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) VALUES (?1, ?2, ?3, ?4)"
+        )?;
+        for (batch_idx, batch) in chunks.chunks(16).enumerate() {
+            let texts: Vec<&str> = batch.iter().map(String::as_str).collect();
+            match emb.embed_batch(&texts) {
+                Ok(vectors) => {
+                    for (offset, (chunk, vector)) in batch.iter().zip(vectors).enumerate() {
+                        let idx = (batch_idx * 16 + offset) as i64;
+                        insert_dense.execute(params![source_id, idx, chunk, f32_slice_to_bytes(&vector)])?;
+                    }
+                }
+                Err(_) => {
+                    for (offset, chunk) in batch.iter().enumerate() {
+                        if let Ok(vector) = emb.embed(chunk) {
+                            let idx = (batch_idx * 16 + offset) as i64;
+                            insert_dense.execute(params![source_id, idx, chunk, f32_slice_to_bytes(&vector)])?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_chunks_for_indexing(text: &str, embedder: Option<&crate::embedder::Embedder>) -> anyhow::Result<Vec<String>> {
+    let mode = std::env::var("REMAINDER_CHUNK_MODE").unwrap_or_else(|_| "character".into());
+    anyhow::ensure!(mode == "character" || mode == "token", "REMAINDER_CHUNK_MODE must be character or token");
+    let mut chunks = match (mode.as_str(), embedder) {
+        ("token", Some(embedder)) => embedder.chunk_source(text)?,
+        _ => chunk_text_for_embedding(text),
+    };
+    let max_chunks = std::env::var("REMAINDER_MAX_CHUNKS").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    if max_chunks > 0 { chunks.truncate(max_chunks); }
+    Ok(chunks)
 }
 
 pub fn f32_slice_to_bytes(slice: &[f32]) -> &[u8] {
@@ -76,13 +156,13 @@ pub fn chunk_text_for_embedding(text: &str) -> Vec<String> {
 
             // Look for paragraph break, newline, sentence terminator, or word break
             if let Some(pos) = slice.rfind("\n\n") {
-                end = search_start + pos + 2;
+                end = search_start + slice[..pos].chars().count() + 2;
             } else if let Some(pos) = slice.rfind('\n') {
-                end = search_start + pos + 1;
+                end = search_start + slice[..pos].chars().count() + 1;
             } else if let Some(pos) = slice.rfind(". ") {
-                end = search_start + pos + 2;
+                end = search_start + slice[..pos].chars().count() + 2;
             } else if let Some(pos) = slice.rfind(' ') {
-                end = search_start + pos + 1;
+                end = search_start + slice[..pos].chars().count() + 1;
             }
         }
 
@@ -205,52 +285,41 @@ fn find_best_query_offset(folded: &str, positions: &[usize], query: &str) -> Opt
 pub fn extract_passage_smart(raw: &str, fact_content: &str, query: &str, max_len: usize) -> String {
     if max_len == 0 { return String::new(); }
     let raw_trimmed = raw.trim();
-    if raw_trimmed.chars().count() <= max_len {
+    if raw_trimmed.chars().take(max_len.saturating_add(1)).count() <= max_len {
         let single_line = raw_trimmed.lines().collect::<Vec<_>>().join(" ");
         return single_line;
     }
-    let chars: Vec<char> = raw.chars().collect();
-    let mut folded = String::new();
-    let mut positions = Vec::new();
-    for (index, ch) in chars.iter().enumerate() {
-        for lower in ch.to_lowercase() {
-            folded.push(lower);
-            positions.extend(std::iter::repeat(index).take(lower.len_utf8()));
-        }
-    }
-
-    let mut matched_offset = None;
-
-    // 1. If fact_content is a known chunk, locate where it appears in raw
     let fact_trimmed = fact_content.trim();
-    if !fact_trimmed.is_empty() && fact_trimmed != "SOURCE" {
-        let probe = if fact_trimmed.chars().count() > 60 {
-            fact_trimmed.chars().take(60).collect::<String>().to_lowercase()
-        } else {
-            fact_trimmed.to_lowercase()
-        };
-        if let Some(offset) = folded.find(&probe) {
-            matched_offset = Some(positions[offset]);
-        }
-    }
-
-    // 2. If not located via fact_content, find highest density query keyword window
+    // Indexed chunks collapse source line breaks. Locate their original position
+    // so distinct hits do not all inherit the same generic query excerpt.
+    let mut matched_offset = if fact_trimmed != "SOURCE" {
+        crate::retrieval::locate_normalized_passage(raw, fact_trimmed)
+    } else {
+        None
+    };
     if matched_offset.is_none() {
+        let mut folded = String::new();
+        let mut positions = Vec::new();
+        for (index, ch) in raw.chars().enumerate() {
+            for lower in ch.to_lowercase() {
+                folded.push(lower);
+                positions.extend(std::iter::repeat(index).take(lower.len_utf8()));
+            }
+        }
         matched_offset = find_best_query_offset(&folded, &positions, query);
-    }
-
-    // 3. Fallback to fact_content terms if query had no matches
-    if matched_offset.is_none() && !fact_trimmed.is_empty() {
-        matched_offset = find_best_query_offset(&folded, &positions, fact_trimmed);
+        if matched_offset.is_none() && !fact_trimmed.is_empty() {
+            matched_offset = find_best_query_offset(&folded, &positions, fact_trimmed);
+        }
     }
 
     let lead_in = (max_len / 4).min(200);
     let start = matched_offset.map(|p| p.saturating_sub(lead_in)).unwrap_or(0);
-    let end = start.saturating_add(max_len).min(chars.len());
-    let snippet: String = chars[start..end].iter().collect();
+    let mut remaining = raw.chars().skip(start);
+    let snippet: String = remaining.by_ref().take(max_len).collect();
+    let has_tail = remaining.next().is_some();
     let single_line = snippet.lines().collect::<Vec<_>>().join(" ");
     format!("{}{}{}", if start > 0 { "... " } else { "" }, single_line.trim(),
-        if end < chars.len() { " ..." } else { "" })
+        if has_tail { " ..." } else { "" })
 }
 
 fn clean_path_components(path: &Path) -> Vec<std::ffi::OsString> {
@@ -303,6 +372,14 @@ pub struct SearchHit {
 }
 
 impl RemainderEngine {
+    pub fn tracked_source_paths(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT file_path FROM sources")?;
+        let paths = stmt.query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter().filter(|path| !path.starts_with("__")).collect();
+        Ok(paths)
+    }
+
     /// Reuse older spellings containing `.` components instead of creating a
     /// second source when a watcher and startup scan spell the same path differently.
     fn storage_path(&self, path: &str) -> anyhow::Result<String> {
@@ -332,8 +409,19 @@ impl RemainderEngine {
 
         Self::run_migrations(&mut conn)?;
 
-        let embedder = crate::embedder::Embedder::try_new().ok().map(std::sync::Arc::new);
-        let mut engine = Self { conn, embedder };
+        let embedder = match crate::embedder::Embedder::try_new() {
+            Ok(embedder) => Some(std::sync::Arc::new(embedder)),
+            Err(error) if std::env::var("REMAINDER_EMBED_BACKEND").map_or(false, |mode| mode == "ort" || mode == "tract") => return Err(error),
+            Err(_) => None,
+        };
+        let reranker = if std::env::var("REMAINDER_RERANK").as_deref() == Ok("1")
+            && std::env::var("REMAINDER_EMBED_BACKEND").as_deref() != Ok("tract") {
+            match crate::reranker::CrossEncoder::try_new() {
+                Ok(model) => Some(std::sync::Arc::new(model)),
+                Err(error) => { eprintln!("[RERANK] Optional model unavailable: {}", error); None },
+            }
+        } else { None };
+        let mut engine = Self { conn, embedder, reranker };
         let _ = engine.backfill_existing_sources();
         let _ = engine.backfill_embeddings();
 
@@ -569,13 +657,46 @@ impl RemainderEngine {
                  chunk_text,
                  source_id UNINDEXED,
                  chunk_index UNINDEXED
-             );"
+             );
+             CREATE TRIGGER IF NOT EXISTS source_chunks_ad AFTER DELETE ON sources BEGIN
+                 DELETE FROM source_chunks_fts WHERE source_id = old.id;
+             END;"
         )?;
         Ok(())
     }
 
-    /// Backfills embeddings for atomics and sources that lack stored vectors
-    pub fn backfill_embeddings(&self) -> anyhow::Result<usize> {
+    /// Explicitly rebuild passage/vector indexes from preserved source text.
+    /// Source rows, fact history/freshness, and original files are untouched.
+    /// This upgrades partially embedded vaults without expensive startup work.
+    pub fn reindex_sources(&mut self) -> anyhow::Result<usize> {
+        let embedder = self.embedder.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Reindex requires the MiniLM model and a working inference backend"))?;
+        let ids = {
+            let mut statement = self.conn.prepare(
+                "SELECT id FROM sources WHERE raw_content IS NOT NULL AND file_path != '__chat_memory' ORDER BY id"
+            )?;
+            let ids = statement.query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids
+        };
+        let tx = self.conn.transaction()?;
+        // Older vaults could retain derived passage rows after deleting their
+        // source. Remove only those orphans; preserved sources/facts stay intact.
+        tx.execute("DELETE FROM source_chunks_fts WHERE source_id NOT IN (SELECT id FROM sources)", [])?;
+        for id in &ids {
+            let raw: String = tx.query_row("SELECT raw_content FROM sources WHERE id = ?1", params![id], |r| r.get(0))?;
+            let expected = source_chunks_for_indexing(&raw, Some(embedder))?.len();
+            replace_source_indexes(&tx, *id, &raw, Some(embedder))?;
+            let stored: usize = tx.query_row("SELECT count(*) FROM source_embeddings WHERE source_id = ?1", params![id], |r| r.get(0))?;
+            anyhow::ensure!(stored == expected, "Reindex incomplete for source {}: {} of {} vectors; old indexes retained", id, stored, expected);
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
+    /// Backfills embeddings for atomics and sources that lack stored vectors.
+    /// Existing partial coverage is left for the explicit `reindex` command.
+    pub fn backfill_embeddings(&mut self) -> anyhow::Result<usize> {
         let Some(ref emb) = self.embedder else { return Ok(0); };
         let mut count = 0;
 
@@ -588,6 +709,7 @@ impl RemainderEngine {
         let missing_atomics: Vec<(i64, String, String)> = stmt.query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?.filter_map(|r| r.ok()).collect();
+        drop(stmt);
 
         for (id, tag, fact) in missing_atomics {
             let text = format!("[{}] {}", tag, fact);
@@ -610,19 +732,13 @@ impl RemainderEngine {
         let missing_sources: Vec<(i64, String)> = stmt.query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?.filter_map(|r| r.ok()).collect();
+        drop(stmt);
 
         for (s_id, raw) in missing_sources {
-            let chunks = chunk_text_for_embedding(&raw);
-            for (idx, chunk) in chunks.iter().enumerate() {
-                if let Ok(vec) = emb.embed(chunk) {
-                    let bytes = f32_slice_to_bytes(&vec);
-                    let _ = self.conn.execute(
-                        "INSERT OR REPLACE INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) VALUES (?1, ?2, ?3, ?4)",
-                        params![s_id, idx as i64, chunk, bytes],
-                    );
-                    count += 1;
-                }
-            }
+            let tx = self.conn.transaction()?;
+            replace_source_indexes(&tx, s_id, &raw, Some(emb))?;
+            count += tx.query_row("SELECT count(*) FROM source_embeddings WHERE source_id = ?1", params![s_id], |r| r.get::<_, usize>(0))?;
+            tx.commit()?;
         }
 
         Ok(count)
@@ -672,41 +788,7 @@ impl RemainderEngine {
             |row| row.get(0),
         )?;
 
-        let chunks = chunk_text_for_embedding(raw_content);
-        let _ = tx.execute("DELETE FROM source_chunks_fts WHERE source_id = ?1", params![source_id]);
-        for (idx, chunk) in chunks.iter().enumerate() {
-            let _ = tx.execute(
-                "INSERT INTO source_chunks_fts (chunk_text, source_id, chunk_index) VALUES (?1, ?2, ?3)",
-                params![chunk, source_id, idx as i64],
-            );
-        }
-
-        if let Some(ref emb) = self.embedder {
-            let _ = tx.execute("DELETE FROM source_embeddings WHERE source_id = ?1", params![source_id]);
-            let chunks_to_embed: Vec<(usize, &String)> = if chunks.len() <= 300 {
-                chunks.iter().enumerate().collect()
-            } else {
-                let mut selected_indices = Vec::new();
-                let step = chunks.len() as f64 / 300.0;
-                for i in 0..300 {
-                    let idx = (i as f64 * step) as usize;
-                    if idx < chunks.len() && !selected_indices.contains(&idx) {
-                        selected_indices.push(idx);
-                    }
-                }
-                selected_indices.into_iter().map(|idx| (idx, &chunks[idx])).collect()
-            };
-
-            for (idx, chunk) in chunks_to_embed {
-                if let Ok(vec) = emb.embed(chunk) {
-                    let bytes = f32_slice_to_bytes(&vec);
-                    let _ = tx.execute(
-                        "INSERT OR REPLACE INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) VALUES (?1, ?2, ?3, ?4)",
-                        params![source_id, idx as i64, chunk, bytes],
-                    );
-                }
-            }
-        }
+        replace_source_indexes(&tx, source_id, raw_content, self.embedder.as_deref())?;
 
         tx.commit()?;
         Ok(source_id)
@@ -779,10 +861,25 @@ impl RemainderEngine {
     /// 5. Maximum Marginal Relevance (MMR) and source diversity to avoid redundant passages.
     /// 6. High-fidelity passage extraction centered on matching sentences.
     pub fn search(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<SearchHit>> {
-        let max_results = limit.unwrap_or(20);
+        self.search_internal(query, limit, true)
+    }
+
+    fn search_internal(&self, query: &str, limit: Option<usize>, allow_rerank: bool) -> anyhow::Result<Vec<SearchHit>> {
+        let requested_results = limit.unwrap_or(20);
+        let mut max_results = requested_results;
         if max_results == 0 || query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        // Focus keyword retrieval while retaining the original semantic query.
+        let original_query = query;
+        let focus_mode = std::env::var("REMAINDER_QUERY_FOCUS").unwrap_or_else(|_| "lexical".into());
+        let focused = if focus_mode == "1" || focus_mode == "lexical" {
+            crate::retrieval::focus_query(query)
+        } else {
+            query.to_string()
+        };
+        let query = focused.as_str();
+        let dense_query = if focus_mode == "lexical" { original_query } else { query };
 
         struct Candidate {
             vault_tag: String,
@@ -796,12 +893,15 @@ impl RemainderEngine {
         }
 
         let mut candidate_map: HashMap<(String, String), Candidate> = HashMap::new();
+        // Lexical hits retain their semantic rank even when they fall below
+        // the dense-only shortlist. Otherwise the optimization changes RRF.
+        let mut lexical_dense_rows: HashSet<(bool, i64)> = HashSet::new();
         let mut seen_atomic_files: HashSet<String> = HashSet::new();
         let mut seen_exact_tag_files: HashSet<String> = HashSet::new();
 
         // 1. Direct tag lookup
         let mut tag_stmt = self.conn.prepare(
-            "SELECT a.vault_tag, a.fact_content, s.file_path
+            "SELECT a.vault_tag, a.fact_content, s.file_path, a.id
              FROM atomics a
              JOIN sources s ON s.id = a.source_id
              WHERE a.vault_tag = ?1 COLLATE NOCASE AND s.facts_current = 1
@@ -813,11 +913,13 @@ impl RemainderEngine {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
 
         for r in tag_rows {
-            let (tag, content, file_path) = r?;
+            let (tag, content, file_path, row_id) = r?;
+            lexical_dense_rows.insert((true, row_id));
             seen_atomic_files.insert(file_path.clone());
             seen_exact_tag_files.insert(file_path.clone());
             let key = (file_path.clone(), content.clone());
@@ -833,11 +935,15 @@ impl RemainderEngine {
             });
         }
 
+        let reranker = self.reranker.as_ref().filter(|_| allow_rerank && seen_exact_tag_files.is_empty());
+        if reranker.is_some() { max_results = requested_results.max(12); }
+
         // 2. FTS5 BM25 search over atomic propositions
-        let fts_query = sanitize_fts5_query(query);
+        let dense_only = std::env::var("REMAINDER_SEARCH_MODE").as_deref() == Ok("dense");
+        let fts_query = if dense_only { String::new() } else { sanitize_fts5_query(query) };
         if !fts_query.is_empty() {
             let mut fts_stmt = self.conn.prepare(
-                "SELECT a.vault_tag, a.fact_content, s.file_path
+                "SELECT a.vault_tag, a.fact_content, s.file_path, a.id
                  FROM atomics_fts f
                  JOIN atomics a ON a.id = f.rowid
                  JOIN sources s ON s.id = a.source_id
@@ -851,11 +957,13 @@ impl RemainderEngine {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })?;
 
             for (rank_idx, r) in fts_rows.enumerate() {
-                let (tag, content, file_path) = r?;
+                let (tag, content, file_path, row_id) = r?;
+                lexical_dense_rows.insert((true, row_id));
                 seen_atomic_files.insert(file_path.clone());
                 let key = (file_path.clone(), content.clone());
                 candidate_map.entry(key).and_modify(|c| {
@@ -877,9 +985,10 @@ impl RemainderEngine {
             // 3. FTS5 BM25 search over granular source chunks (source_chunks_fts)
             let mut chunk_fts_matched = 0;
             if let Ok(mut chunk_fts_stmt) = self.conn.prepare(
-                "SELECT sc.chunk_text, s.file_path
+                "SELECT sc.chunk_text, s.file_path, se.rowid
                  FROM source_chunks_fts sc
                  JOIN sources s ON s.id = sc.source_id
+                 LEFT JOIN source_embeddings se ON se.source_id = sc.source_id AND se.chunk_index = sc.chunk_index
                  WHERE source_chunks_fts MATCH ?1
                  ORDER BY bm25(source_chunks_fts)
                  LIMIT ?2"
@@ -888,11 +997,13 @@ impl RemainderEngine {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
                     ))
                 }) {
                     for (rank_idx, r) in chunk_rows.filter_map(|r| r.ok()).enumerate() {
-                        let (chunk_text, file_path) = r;
+                        let (chunk_text, file_path, dense_row_id) = r;
                         if !seen_atomic_files.contains(&file_path) {
+                            if let Some(row_id) = dense_row_id { lexical_dense_rows.insert((false, row_id)); }
                             let key = (file_path.clone(), chunk_text.clone());
                             candidate_map.entry(key).and_modify(|c| {
                                 if c.bm25_rank.is_none() || c.bm25_rank > Some(rank_idx + 1) {
@@ -959,72 +1070,93 @@ impl RemainderEngine {
         }
 
         // 4. Dense Vector Semantic Search
-        if let Some(ref emb) = self.embedder {
-            if let Ok(query_vec) = emb.embed(query) {
-                let mut dense_candidates = Vec::new();
-
-                // Vector search over atomics
+        if let Some(ref emb) = self.embedder.as_ref().filter(|_| std::env::var("REMAINDER_SEARCH_MODE").as_deref() != Ok("lexical")) {
+            if let Ok(query_vec) = emb.embed(dense_query) {
+                // Score every vector, but retain text and decoded vectors only
+                // for the best semantic matches. BM25 matches remain in the
+                // candidate map regardless of this dense shortlist.
+                struct DenseRef { sim: f32, row_id: i64, is_atomic: bool }
+                let mut dense_refs: Vec<DenseRef> = Vec::new();
                 let mut atomics_vec_stmt = self.conn.prepare(
-                    "SELECT a.vault_tag, a.fact_content, s.file_path, ae.embedding
+                    "SELECT a.id, ae.embedding
                      FROM atomics a
                      JOIN atomics_embeddings ae ON ae.atomic_id = a.id
                      JOIN sources s ON s.id = a.source_id
                      WHERE s.facts_current = 1"
                 )?;
-
                 let atomics_rows = atomics_vec_stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                    ))
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })?;
-
                 for r in atomics_rows {
-                    let (tag, content, file_path, emb_bytes) = r?;
-                    let vec = bytes_to_f32_vec(&emb_bytes);
-                    if vec.len() == emb.dimension {
-                        let sim = crate::embedder::cosine_similarity(&query_vec, &vec);
+                    let (row_id, bytes) = r?;
+                    if let Some(sim) = crate::embedder::cosine_similarity_bytes(&query_vec, &bytes) {
                         if sim >= 0.16 {
-                            dense_candidates.push((sim, tag, content, file_path, vec, true));
+                            dense_refs.push(DenseRef { sim, row_id, is_atomic: true });
                         }
                     }
                 }
 
-                // Vector search over source chunks
                 let mut source_vec_stmt = self.conn.prepare(
-                    "SELECT se.chunk_text, s.file_path, se.embedding
+                    "SELECT se.rowid, s.file_path, se.embedding
                      FROM source_embeddings se
                      JOIN sources s ON s.id = se.source_id"
                 )?;
-
                 let source_rows = source_vec_stmt.query_map([], |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                     ))
                 })?;
-
                 for r in source_rows {
-                    let (chunk_text, file_path, emb_bytes) = r?;
+                    let (row_id, file_path, bytes) = r?;
                     if !seen_exact_tag_files.contains(&file_path) {
-                        let vec = bytes_to_f32_vec(&emb_bytes);
-                        if vec.len() == emb.dimension {
-                            let sim = crate::embedder::cosine_similarity(&query_vec, &vec);
+                        if let Some(sim) = crate::embedder::cosine_similarity_bytes(&query_vec, &bytes) {
                             if sim >= 0.16 {
-                                dense_candidates.push((sim, "SOURCE".to_string(), chunk_text, file_path, vec, false));
+                                dense_refs.push(DenseRef { sim, row_id, is_atomic: false });
                             }
                         }
                     }
                 }
+                let dense_limit = max_results.saturating_mul(50).max(256);
+                let by_similarity = |a: &DenseRef, b: &DenseRef| {
+                    b.sim.partial_cmp(&a.sim).unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.is_atomic.cmp(&a.is_atomic))
+                        .then_with(|| a.row_id.cmp(&b.row_id))
+                };
+                // Sort compact references so lexical matches receive their
+                // exact global dense rank, then fetch only the rows needed.
+                dense_refs.sort_unstable_by(by_similarity);
 
-                dense_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-                for (rank_idx, (sim, tag, content, file_path, vec, is_atomic)) in dense_candidates.into_iter().enumerate() {
+                let mut fetch_atomic = self.conn.prepare(
+                    "SELECT a.vault_tag, a.fact_content, s.file_path, ae.embedding
+                     FROM atomics a JOIN atomics_embeddings ae ON ae.atomic_id = a.id
+                     JOIN sources s ON s.id = a.source_id WHERE a.id = ?1"
+                )?;
+                let mut fetch_source = self.conn.prepare(
+                    "SELECT se.chunk_text, s.file_path, se.embedding
+                     FROM source_embeddings se JOIN sources s ON s.id = se.source_id
+                     WHERE se.rowid = ?1"
+                )?;
+                for (rank_idx, hit) in dense_refs.into_iter().enumerate() {
+                    if rank_idx >= dense_limit && !lexical_dense_rows.contains(&(hit.is_atomic, hit.row_id)) {
+                        continue;
+                    }
+                    let (tag, content, file_path, bytes) = if hit.is_atomic {
+                        fetch_atomic.query_row(params![hit.row_id], |row| Ok((
+                            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?
+                        )))?
+                    } else {
+                        let (content, file_path, bytes) = fetch_source.query_row(params![hit.row_id], |row| Ok((
+                            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?
+                        )))?;
+                        ("SOURCE".to_string(), content, file_path, bytes)
+                    };
+                    let vec = bytes_to_f32_vec(&bytes);
+                    let sim = hit.sim;
                     let key = (file_path.clone(), content.clone());
-                    if is_atomic {
+                    if hit.is_atomic {
                         seen_atomic_files.insert(file_path.clone());
                     }
                     candidate_map.entry(key).and_modify(|c| {
@@ -1053,17 +1185,25 @@ impl RemainderEngine {
             fact_content: String,
             file_path: String,
             rrf_score: f64,
+            lexical_rank: Option<usize>,
+            dense_rank: Option<usize>,
             bm25_rank: f64,
             embedding: Option<Vec<f32>>,
         }
 
+        let rrf_k = std::env::var("REMAINDER_RRF_K").ok().and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 1.0).unwrap_or(60.0);
+        let dense_weight = crate::retrieval::hybrid_dense_weight(original_query,
+            &std::env::var("REMAINDER_DENSE_WEIGHT").unwrap_or_else(|_| "1".into()));
+        let mmr_penalty = std::env::var("REMAINDER_MMR_PENALTY").ok().and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(0.006);
         let mut scored_candidates: Vec<CandidateScored> = candidate_map.into_values().map(|c| {
             let rrf_bm25 = match c.bm25_rank {
-                Some(r) => 1.0 / (60.0 + r as f64),
+                Some(r) => 1.0 / (rrf_k + r as f64),
                 None => 0.0,
             };
             let rrf_dense = match c.dense_rank {
-                Some(r) => 1.0 / (60.0 + r as f64),
+                Some(r) => 1.0 / (rrf_k + r as f64),
                 None => 0.0,
             };
             let tag_boost = if c.is_exact_tag { 1.0 } else { 0.0 };
@@ -1073,7 +1213,7 @@ impl RemainderEngine {
                 _ => 0.0,
             };
 
-            let total_score = rrf_bm25 + rrf_dense + tag_boost + atomic_boost + sim_boost;
+            let total_score = rrf_bm25 + dense_weight * rrf_dense + tag_boost + atomic_boost + sim_boost;
 
             let display_rank = if c.is_exact_tag {
                 -100.0
@@ -1090,12 +1230,17 @@ impl RemainderEngine {
                 fact_content: c.fact_content,
                 file_path: c.file_path,
                 rrf_score: total_score,
+                lexical_rank: c.bm25_rank,
+                dense_rank: c.dense_rank,
                 bm25_rank: display_rank,
                 embedding: c.embedding,
             }
         }).collect();
 
-        scored_candidates.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
+        scored_candidates.sort_by(|a, b| fused_order(
+            (a.rrf_score, a.lexical_rank, a.dense_rank, &a.file_path, &a.fact_content),
+            (b.rrf_score, b.lexical_rank, b.dense_rank, &b.file_path, &b.fact_content),
+        ));
 
         // 6. MMR & Source Diversity Selection
         let mut selected: Vec<CandidateScored> = Vec::new();
@@ -1119,7 +1264,7 @@ impl RemainderEngine {
                     0.0
                 };
 
-                let mmr = cand.rrf_score - 0.006 * max_sim - diversity_penalty;
+                let mmr = if dense_only { cand.rrf_score } else { cand.rrf_score - mmr_penalty * max_sim - diversity_penalty };
                 if mmr > best_mmr {
                     best_mmr = mmr;
                     best_idx = idx;
@@ -1130,16 +1275,33 @@ impl RemainderEngine {
             selected.push(chosen);
         }
 
+        // Rerank raw candidate passages before any source excerpts are built.
+        // The pool follows the same MMR policy as requesting twelve native hits.
+        if let Some(reranker) = reranker {
+            let passages: Vec<&str> = selected.iter().map(|candidate| candidate.fact_content.as_str()).collect();
+            match reranker.rank(original_query, &passages, requested_results) {
+                Ok(order) => {
+                    let mut slots: Vec<Option<CandidateScored>> = selected.into_iter().map(Some).collect();
+                    selected = order.into_iter().filter_map(|index| slots[index].take()).collect();
+                }
+                Err(error) => {
+                    eprintln!("[RERANK] Scoring failed; using native retrieval: {}", error);
+                    return self.search_internal(original_query, Some(requested_results), false);
+                }
+            }
+        }
+
         // 7. Format final SearchHit results with high-fidelity excerpts
         let mut raw_cache: HashMap<String, Option<String>> = HashMap::new();
         let mut get_raw_stmt = self.conn.prepare("SELECT raw_content FROM sources WHERE file_path = ?1")?;
+        let excerpt_chars = excerpt_char_limit();
 
-        let results = selected.into_iter().map(|s| {
+        let results: Vec<SearchHit> = selected.into_iter().map(|s| {
             let raw_opt = raw_cache.entry(s.file_path.clone()).or_insert_with(|| {
                 get_raw_stmt.query_row(params![s.file_path], |r| r.get(0)).ok()
             });
             let raw_excerpt = raw_opt.as_ref().map(|raw| {
-                extract_passage_smart(raw, &s.fact_content, query, 1000)
+                extract_passage_smart(raw, &s.fact_content, query, excerpt_chars)
             });
             SearchHit {
                 vault_tag: s.vault_tag,
@@ -1215,40 +1377,7 @@ impl RemainderEngine {
         }
 
         if let Some(text) = raw_content {
-            let chunks = chunk_text_for_embedding(text);
-            let _ = tx.execute("DELETE FROM source_chunks_fts WHERE source_id = ?1", params![source_id]);
-            for (idx, chunk) in chunks.iter().enumerate() {
-                let _ = tx.execute(
-                    "INSERT INTO source_chunks_fts (chunk_text, source_id, chunk_index) VALUES (?1, ?2, ?3)",
-                    params![chunk, source_id, idx as i64],
-                );
-            }
-            if let Some(ref emb) = self.embedder {
-                let _ = tx.execute("DELETE FROM source_embeddings WHERE source_id = ?1", params![source_id]);
-                let chunks_to_embed: Vec<(usize, &String)> = if chunks.len() <= 300 {
-                    chunks.iter().enumerate().collect()
-                } else {
-                    let mut selected_indices = Vec::new();
-                    let step = chunks.len() as f64 / 300.0;
-                    for i in 0..300 {
-                        let idx = (i as f64 * step) as usize;
-                        if idx < chunks.len() && !selected_indices.contains(&idx) {
-                            selected_indices.push(idx);
-                        }
-                    }
-                    selected_indices.into_iter().map(|idx| (idx, &chunks[idx])).collect()
-                };
-
-                for (idx, chunk) in chunks_to_embed {
-                    if let Ok(vec) = emb.embed(chunk) {
-                        let bytes = f32_slice_to_bytes(&vec);
-                        let _ = tx.execute(
-                            "INSERT OR REPLACE INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) VALUES (?1, ?2, ?3, ?4)",
-                            params![source_id, idx as i64, chunk, bytes],
-                        );
-                    }
-                }
-            }
+            replace_source_indexes(&tx, source_id, text, self.embedder.as_deref())?;
         }
 
         tx.commit()?;
@@ -1370,7 +1499,7 @@ impl RemainderEngine {
 
         let mut purged = 0;
         for (id, file_path) in rows {
-            if file_path == "__legacy__" || file_path.starts_with("__legacy_source_") {
+            if file_path == "__legacy__" || file_path.starts_with("__legacy_source_") || file_path == "__chat_memory" {
                 continue;
             }
             if !Path::new(&file_path).exists() {
@@ -1557,6 +1686,145 @@ pub struct BunkerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tied_fusion_scores_are_independent_of_hash_iteration_order() {
+        for _ in 0..32 {
+            let mut candidates = HashMap::new();
+            candidates.insert("b", (1.0, Some(2), Some(1), "file", "b"));
+            candidates.insert("a", (1.0, Some(1), Some(2), "file", "a"));
+            candidates.insert("c", (1.0, None, Some(0), "file", "c"));
+            let mut ranked: Vec<_> = candidates.into_values().collect();
+            ranked.sort_by(|a, b| fused_order(*a, *b));
+            assert_eq!(ranked.iter().map(|item| item.4).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        }
+    }
+
+    #[test]
+    fn optional_reranker_respects_limits_and_exact_tag_bypass() -> anyhow::Result<()> {
+        let reranker = match crate::reranker::CrossEncoder::try_new() { Ok(model) => model, Err(_) => return Ok(()) };
+        let mut engine = RemainderEngine::new(":memory:")?;
+        engine.embedder = None;
+        engine.reranker = None;
+        for index in 0..20 {
+            let text = format!("Image upload endpoint {} accepts multipart file requests", index);
+            engine.refresh_source_facts(&format!("route-{}.md", index), Some(&text), vec![("NOTE".into(), text.clone())])?;
+        }
+        let mut expected: Vec<String> = engine.search("NOTE", Some(3))?.into_iter().map(|hit| hit.fact_content).collect();
+        engine.reranker = Some(std::sync::Arc::new(reranker));
+        let mut actual: Vec<String> = engine.search("NOTE", Some(3))?.into_iter().map(|hit| hit.fact_content).collect();
+        expected.sort(); actual.sort();
+        assert_eq!(actual, expected, "Exact category matches must bypass cross-encoder ordering");
+        assert_eq!(engine.search("image upload endpoint", Some(2))?.len(), 2);
+        assert!(engine.search("image upload endpoint", Some(0))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_source_removes_passage_rows_without_touching_other_sources() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+        engine.embedder = None;
+        engine.record_source_content("keep.md", "Retain this indexed source passage.")?;
+        engine.record_source_content("remove.md", "Remove this indexed source passage.")?;
+        let removed_path = engine.storage_path("remove.md")?;
+        let id: i64 = engine.conn.query_row("SELECT id FROM sources WHERE file_path = ?1", params![removed_path], |r| r.get(0))?;
+        let before: usize = engine.conn.query_row("SELECT count(*) FROM source_chunks_fts WHERE source_id = ?1", params![id], |r| r.get(0))?;
+        assert!(before > 0);
+        engine.conn.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
+        let remaining: usize = engine.conn.query_row("SELECT count(*) FROM source_chunks_fts WHERE source_id = ?1", params![id], |r| r.get(0))?;
+        assert_eq!(remaining, 0);
+        assert!(engine.get_source_content("keep.md")?.is_some());
+        assert!(!engine.search("Retain indexed source", Some(5))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_reindex_restores_partial_coverage_preserving_facts_and_freshness() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+        let Some(embedder) = engine.embedder.take() else { return Ok(()); };
+        let raw = (0..80).map(|index| format!("Section {} explains a distinct architecture decision with database transaction safeguards and deployment configuration.\n", index)).collect::<String>();
+        engine.refresh_source_facts("archived/moved.md", Some(&raw), vec![("ARCH".into(), "Preserve this architectural decision".into())])?;
+        engine.record_source_content("archived/stale.md", "Another archived source awaiting fact extraction")?;
+        engine.save_memory_fact("NOTE", "Keep the standalone chat memory")?;
+        let stored_path = engine.storage_path("archived/moved.md")?;
+        engine.conn.execute("UPDATE sources SET observed_at = '2026-01-01', last_shredded = '2026-01-01' WHERE file_path = ?1", params![stored_path])?;
+        let before = engine.source_state("archived/moved.md")?;
+        engine.conn.execute("DELETE FROM source_chunks_fts", [])?;
+        engine.conn.execute("INSERT INTO source_chunks_fts (source_id, chunk_index, chunk_text) VALUES (99999, 0, 'orphaned old passage')", [])?;
+        engine.conn.execute(
+            "INSERT INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) SELECT id, 0, 'partial old index', ?1 FROM sources WHERE file_path = ?2",
+            params![f32_slice_to_bytes(&[0.3f32; 384]), stored_path],
+        )?;
+        engine.embedder = Some(embedder);
+        assert_eq!(engine.reindex_sources()?, 2);
+        let orphans: usize = engine.conn.query_row("SELECT count(*) FROM source_chunks_fts WHERE source_id NOT IN (SELECT id FROM sources)", [], |r| r.get(0))?;
+        assert_eq!(orphans, 0);
+        assert_eq!(engine.source_state("archived/moved.md")?, before);
+        assert_eq!(engine.source_state("archived/stale.md")?.unwrap().1, false);
+        assert_eq!(engine.get_facts_by_tag("ARCH", None)?, vec!["Preserve this architectural decision"]);
+        assert_eq!(engine.get_facts_by_tag("NOTE", None)?, vec!["Keep the standalone chat memory"]);
+        let counts: (usize, usize) = engine.conn.query_row("SELECT (SELECT count(*) FROM source_embeddings), (SELECT count(*) FROM source_chunks_fts)", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        assert_eq!(counts.0, counts.1);
+        assert!(counts.0 > 1);
+        let mismatched: usize = engine.conn.query_row(
+            "SELECT count(*) FROM source_chunks_fts f JOIN source_embeddings e ON e.source_id = f.source_id AND e.chunk_index = f.chunk_index WHERE f.chunk_text != e.chunk_text",
+            [], |row| row.get(0))?;
+        assert_eq!(mismatched, 0, "FTS and dense indexes must share the same token-bounded passages");
+        let timestamp: String = engine.conn.query_row("SELECT observed_at FROM sources WHERE file_path = ?1", params![stored_path], |r| r.get(0))?;
+        assert_eq!(timestamp, "2026-01-01");
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_hit_keeps_dense_rank_below_shortlist() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+        let Some(embedder) = engine.embedder.clone() else { return Ok(()); };
+        let query_vector = embedder.embed("lexicalrare")?;
+        // Keep indexing deterministic and inexpensive; these controlled vectors
+        // model a lexical hit ranked behind 300 stronger semantic-only matches.
+        engine.embedder = None;
+        let content = "lexicalrare target passage";
+        let source_id = engine.record_source_content("ranking.md", content)?;
+        let vector = |similarity: f32| -> Vec<f32> {
+            let mut perpendicular = vec![0.0; query_vector.len()];
+            perpendicular[0] = 1.0;
+            for (v, q) in perpendicular.iter_mut().zip(&query_vector) { *v -= query_vector[0] * q; }
+            let norm = perpendicular.iter().map(|v| v * v).sum::<f32>().sqrt();
+            query_vector.iter().zip(perpendicular).map(|(q, v)| similarity * q + (1.0 - similarity * similarity).sqrt() * v / norm).collect()
+        };
+        let low = vector(0.2);
+        let high = vector(0.45);
+        engine.conn.execute(
+            "INSERT INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) VALUES (?1, 0, ?2, ?3)",
+            params![source_id, content, f32_slice_to_bytes(&low)],
+        )?;
+        for index in 1..=300 {
+            engine.conn.execute(
+                "INSERT INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) VALUES (?1, ?2, ?3, ?4)",
+                params![source_id, index, format!("Generic semantic background {}", index), f32_slice_to_bytes(&high)],
+            )?;
+        }
+        engine.embedder = Some(embedder);
+        let hits = engine.search("lexicalrare", Some(1))?;
+        assert_eq!(hits[0].fact_content, content,
+            "The lexical hit's rank-300 semantic contribution must survive dense-only shortlisting");
+        Ok(())
+    }
+
+    #[test]
+    fn source_change_without_model_removes_old_dense_vectors() -> anyhow::Result<()> {
+        let mut engine = RemainderEngine::new(":memory:")?;
+        engine.embedder = None;
+        let source_id = engine.record_source_content("project.md", "Original searchable project state")?;
+        engine.conn.execute(
+            "INSERT INTO source_embeddings (source_id, chunk_index, chunk_text, embedding) VALUES (?1, 0, 'Original state', ?2)",
+            params![source_id, f32_slice_to_bytes(&[0.4f32; 384])],
+        )?;
+        engine.record_source_content("project.md", "Replacement searchable project state")?;
+        let remaining: i64 = engine.conn.query_row("SELECT count(*) FROM source_embeddings", [], |r| r.get(0))?;
+        assert_eq!(remaining, 0, "A model outage must not leave old content retrievable by its vectors");
+        Ok(())
+    }
 
     #[test]
     fn test_sqlite_fts5_natural_language_search_and_provenance() -> anyhow::Result<()> {
@@ -2344,6 +2612,13 @@ mod tests {
     }
 
     #[test]
+    fn source_index_without_model_keeps_character_chunker_fallback() -> anyhow::Result<()> {
+        let raw = "Fallback source text and UTF-8 漢字 notes.\n".repeat(100);
+        assert_eq!(source_chunks_for_indexing(&raw, None)?, chunk_text_for_embedding(&raw));
+        Ok(())
+    }
+
+    #[test]
     fn test_source_chunks_fts_granular_passage_retrieval() -> anyhow::Result<()> {
         let mut engine = RemainderEngine::new(":memory:")?;
         
@@ -2373,6 +2648,24 @@ mod tests {
         assert!(excerpt.contains("/upload/image"), "Raw excerpt must contain route, got: {}", excerpt);
         assert!(excerpt.contains("comfy_image_upload_v2"), "Raw excerpt must contain function body");
         Ok(())
+    }
+
+    #[test]
+    fn test_smart_excerpts_follow_distinct_whitespace_collapsed_chunks() {
+        let prefix = "Unrelated introduction and setup. ".repeat(50);
+        let middle = "Separate unrelated material. ".repeat(50);
+        let first = "fn test_eval(self):\n    # GH 16363\n    result = DataFrame({'x': [0]})";
+        let second = "fn test_upload(self):\n    # GH 98765\n    result = post('/upload/image')";
+        let raw = format!("{}\n{}\n{}\n{}", prefix, first, middle, second);
+        let first_chunk = "fn test_eval(self): # GH 16363 result = DataFrame({'x': [0]})";
+        let second_chunk = "fn test_upload(self): # GH 98765 result = post('/upload/image')";
+        let first_excerpt = extract_passage_smart(&raw, first_chunk, "How are tests handled?", 400);
+        let second_excerpt = extract_passage_smart(&raw, second_chunk, "How are tests handled?", 400);
+        assert!(first_excerpt.contains("test_eval") && first_excerpt.contains("GH 16363"));
+        assert!(second_excerpt.contains("test_upload") && second_excerpt.contains("GH 98765"));
+        assert!(!first_excerpt.contains("test_upload"));
+        assert!(!second_excerpt.contains("test_eval"));
+        assert_ne!(first_excerpt, second_excerpt);
     }
 
     #[test]

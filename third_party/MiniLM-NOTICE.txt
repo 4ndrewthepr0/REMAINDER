@@ -1,0 +1,9 @@
+all-MiniLM-L6-v2
+Model: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+Authors: sentence-transformers contributors; Microsoft (MiniLM base model)
+License: Apache License, Version 2.0 (see Apache-2.0.txt).
+The ONNX export is distributed by Chroma:
+https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz
+
+ONNX Runtime is a separate Microsoft component, licensed under MIT.
+Its LICENSE and ThirdPartyNotices are installed alongside its native DLL.

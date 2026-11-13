@@ -1,4 +1,5 @@
 # REMAINDER Automated One-Step Installer (Windows)
+param([switch]$SkipBuild, [switch]$SkipModel, [switch]$SkipRuntime, [string]$RuntimeSource, [string]$BinarySource)
 $ErrorActionPreference = "Stop"
 
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -10,20 +11,30 @@ if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 }
 
-$sourceExe = Join-Path $PSScriptRoot "target\release\remainder.exe"
-if (-not (Test-Path $sourceExe)) {
-    Write-Host "[BUILD] Release binary not found locally. Building with Cargo..." -ForegroundColor Yellow
-    $env:LIBRARY_PATH = "C:\Program Files\Rust stable GNU 1.99\lib\rustlib\x86_64-pc-windows-gnu\lib\self-contained"
-    cargo build --release --bin remainder
+$sourceExe = if ($BinarySource) { $BinarySource } else { Join-Path $PSScriptRoot "target\release\remainder.exe" }
+if (-not $SkipBuild -and -not $BinarySource) {
+    Write-Host "[BUILD] Building current source with Cargo..." -ForegroundColor Yellow
+    $previousLibraryPath = $env:LIBRARY_PATH
+    try {
+        $sysroot = & rustc --print sysroot
+        if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain not found.' }
+        $gnuLibraries = Join-Path $sysroot 'lib\rustlib\x86_64-pc-windows-gnu\lib\self-contained'
+        if (Test-Path -LiteralPath $gnuLibraries) { $env:LIBRARY_PATH = "$gnuLibraries;$previousLibraryPath" }
+        & cargo build --release --bin remainder --manifest-path (Join-Path $PSScriptRoot 'Cargo.toml')
+        if ($LASTEXITCODE -ne 0) { throw 'Build failed. Close running REMAINDER processes if Windows reports a locked executable.' }
+    } finally { $env:LIBRARY_PATH = $previousLibraryPath }
 }
+if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) { throw "Binary missing: $sourceExe" }
+& (Join-Path $PSScriptRoot 'scripts\install-native-assets.ps1') -SkipModel:$SkipModel -SkipRuntime:$SkipRuntime -RuntimeSource $RuntimeSource
 
 $destExe = Join-Path $installDir "remainder.exe"
+if (Test-Path -LiteralPath $destExe) { Copy-Item -LiteralPath $destExe -Destination "$destExe.previous" -Force }
 Copy-Item -Path $sourceExe -Destination $destExe -Force
 Write-Host "[OK] Installed remainder.exe to: $destExe" -ForegroundColor Green
 
 # Ensure user's PATH contains ~/.local/bin
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$installDir*") {
+if (($userPath -split ';') -notcontains $installDir) {
     [Environment]::SetEnvironmentVariable("Path", "$userPath;$installDir", "User")
     $env:PATH = "$env:PATH;$installDir"
     Write-Host "[OK] Added $installDir to user PATH." -ForegroundColor Green

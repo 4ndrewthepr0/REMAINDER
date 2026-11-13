@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn chunk_boundaries_use_unicode_character_offsets() {
+    let raw = format!("{}\n\n{}\n{} END_MARKER", "部署資料".repeat(190), "🚀資料".repeat(190), "é".repeat(850));
+    let chunks = engine::chunk_text_for_embedding(&raw);
+    assert!(chunks.len() > 3);
+    assert!(chunks.iter().any(|chunk| chunk.contains("END_MARKER")));
+}
+
+#[test]
+fn mcp_sync_discovers_changes_and_preserves_saved_memory() -> anyhow::Result<()> {
+    let root = std::env::temp_dir().join(format!("remainder_mcp_sync_{}", std::process::id()));
+    std::fs::create_dir_all(&root)?;
+    let file = root.join("notes.md");
+    std::fs::write(&file, "First version of project notes")?;
+    let mut engine = engine::RemainderEngine::new(":memory:")?;
+    engine.save_memory_fact("NOTE", "Persistent chat decision")?;
+    engine.record_source_content("missing-outside-root.md", "Keep archived project note")?;
+    assert_eq!(sync_mcp_sources(&mut engine, Some(&root))?, 1);
+    assert!(engine.search("First version", None)?.iter().any(|hit| hit.file_path == file.to_string_lossy()));
+    std::fs::write(&file, "Second version of project notes")?;
+    assert_eq!(sync_mcp_sources(&mut engine, Some(&root))?, 1);
+    assert_eq!(sync_mcp_sources(&mut engine, Some(&root))?, 0);
+    assert!(engine.search("Second version", None)?.iter().any(|hit| hit.file_path == file.to_string_lossy()));
+    assert_eq!(engine.get_facts_by_tag("NOTE", None)?, vec!["Persistent chat decision"]);
+    std::fs::remove_file(&file)?;
+    assert_eq!(sync_mcp_sources(&mut engine, Some(&root))?, 0);
+    assert!(engine.search("Second version", None)?.is_empty());
+    assert_eq!(engine.get_facts_by_tag("NOTE", None)?, vec!["Persistent chat decision"]);
+    assert!(engine.search("archived project", None)?.iter().any(|hit| hit.file_path == "missing-outside-root.md"));
+    std::fs::remove_dir(&root)?;
+    Ok(())
+}
+
+#[test]
 fn watcher_dot_paths_reuse_existing_source_and_pending_key() -> anyhow::Result<()> {
     let mut engine = engine::RemainderEngine::new(":memory:")?;
     engine.refresh_source_facts("project/file.md", Some("Old"), vec![("TAG".into(), "Old".into())])?;

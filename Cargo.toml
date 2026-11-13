@@ -1,6 +1,6 @@
 [package]
 name = "remainder"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "The Industrial Memory Bunker for AI Agents. Local-first, zero Python dependencies, sub-second retrieval, native MCP support."
@@ -19,3 +19,4 @@ hex = "0.4"
 walkdir = "2.5"
 tract-onnx = "0.23.9"
 tokenizers = "0.23.2"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }

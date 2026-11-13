@@ -1,4 +1,6 @@
 mod engine;
+mod retrieval;
+mod reranker;
 mod shredder;
 pub mod embedder;
 #[cfg(test)]
@@ -13,6 +15,29 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
 use serde_json::json;
 use sha2::{Sha256, Digest};
+
+fn search_hit_evidence(hit: &engine::SearchHit, deduplicate: bool) -> (String, Option<String>) {
+    let context = hit.raw_excerpt.as_ref().map(|excerpt| {
+        excerpt.lines().collect::<Vec<_>>().join(" ").chars()
+            .take(engine::excerpt_char_limit()).collect::<String>()
+    });
+    if deduplicate && hit.vault_tag == "SOURCE" && !hit.fact_content.trim().is_empty() {
+        if let Some(ref excerpt) = context {
+            let normalized = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+            // Omit a duplicate only when the displayed excerpt contains the
+            // entire indexed passage. A clipped excerpt must retain the fact.
+            if normalized(excerpt).contains(&normalized(&hit.fact_content)) {
+                return (excerpt.clone(), None);
+            }
+        }
+    }
+    (hit.fact_content.clone(), context)
+}
+
+fn rendered_hit_evidence(hit: &engine::SearchHit) -> (String, Option<String>) {
+    let deduplicate = env::var("REMAINDER_EVIDENCE_MODE").ok().as_deref() == Some("deduplicated");
+    search_hit_evidence(hit, deduplicate)
+}
 
 pub fn is_supported_file(path: &Path) -> bool {
     if is_ignored_path(path) { return false; }
@@ -637,7 +662,7 @@ pub fn process_mcp_message(line: &str, engine: &mut engine::RemainderEngine) -> 
                     "capabilities": { "tools": {} },
                     "serverInfo": {
                         "name": "remainder-bunker",
-                        "version": "0.4.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     }
                 }
             }))
@@ -720,11 +745,10 @@ pub fn process_mcp_message(line: &str, engine: &mut engine::RemainderEngine) -> 
                     Ok(hits) if !hits.is_empty() => {
                         hits.iter()
                             .map(|h| {
-                                let mut s = format!("[BUNKER] [{}] -> {}", h.vault_tag, h.fact_content);
+                                let (body, context) = rendered_hit_evidence(h);
+                                let mut s = format!("[BUNKER] [{}] -> {}", h.vault_tag, body);
                                 s.push_str(&format!("\n  Source: {}", h.file_path));
-                                if let Some(ref exc) = h.raw_excerpt {
-                                    let single_line = exc.lines().collect::<Vec<_>>().join(" ");
-                                    let preview: String = single_line.chars().take(1000).collect();
+                                if let Some(preview) = context {
                                     s.push_str(&format!("\n  Context: \"{}\"", preview));
                                 }
                                 s
@@ -781,16 +805,56 @@ pub fn process_mcp_message(line: &str, engine: &mut engine::RemainderEngine) -> 
     }
 }
 
+fn sync_mcp_sources(engine: &mut engine::RemainderEngine, root: Option<&Path>) -> anyhow::Result<usize> {
+    let mut paths: HashSet<PathBuf> = engine.tracked_source_paths()?
+        .into_iter().map(PathBuf::from).collect();
+    if let Some(root) = root {
+        if root.is_dir() {
+            paths.extend(collect_project_files(root));
+        }
+    }
+    let mut updated = 0;
+    let sync_root = root.filter(|root| root.is_dir());
+    for path in paths {
+        if !is_supported_file(&path) { continue; }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                if path.exists() {
+                    eprintln!("[MCP SYNC] {}: {}", path.display(), error);
+                } else if sync_root.map_or(false, |root| path.starts_with(root)) {
+                    engine.remove_source_or_prefix(&path.to_string_lossy())?;
+                }
+                continue;
+            }
+        };
+        let state = engine.source_state(&path.to_string_lossy())?;
+        if state.as_ref().map_or(true, |(raw, _)| raw.as_deref() != Some(content.as_str())) {
+            engine.record_source_content(&path.to_string_lossy(), &content)?;
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
 fn run_mcp_stdio_server(engine: &mut engine::RemainderEngine) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let reader = stdin.lock();
+    let sync_root = env::var_os("REMAINDER_MCP_SYNC_ROOT").map(PathBuf::from);
+    let mut last_sync: Option<Instant> = None;
 
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
         };
+        if line.contains("tools/call") && last_sync.map_or(true, |last| last.elapsed() >= Duration::from_secs(30)) {
+            if let Err(error) = sync_mcp_sources(engine, sync_root.as_deref()) {
+                eprintln!("[MCP SYNC] {}", error);
+            }
+            last_sync = Some(Instant::now());
+        }
         if let Some(resp) = process_mcp_message(&line, engine) {
             writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
             stdout.flush()?;
@@ -828,6 +892,7 @@ COMMANDS:
     query <QUERY> [LIMIT] Search atomic facts and source passages (BM25 + Tag lookup)
     source <PATH>        Retrieve preserved verbatim raw source content for PATH
     stats                Display vault diagnostics, fact freshness, and storage health
+    reindex              Rebuild passage/vector indexes from preserved source text
     repair               Run SQLite integrity checks and rebuild FTS5 search indices
     mcp                  Run Model Context Protocol (MCP) server over Stdio
     mcp list             List available MCP tools as JSON
@@ -840,7 +905,17 @@ FLAGS:
 ENVIRONMENT VARIABLES:
     REMAINDER_DB         Path to SQLite vault database (default: remainder.db)
     REMAINDER_MODEL      Ollama model name for proposition extraction (default: llama3.1:8b)
-    REMAINDER_OLLAMA_URL Ollama HTTP API endpoint (default: http://localhost:11434)",
+    REMAINDER_OLLAMA_URL Ollama HTTP API endpoint (default: http://localhost:11434)
+    REMAINDER_MODEL_DIR  MiniLM folder containing model.onnx and tokenizer.json
+    REMAINDER_EMBED_BACKEND auto (default), ort (require ONNX Runtime), or tract
+    REMAINDER_ORT_DYLIB_PATH Optional native ONNX Runtime library path
+    REMAINDER_EMBED_THREADS ONNX Runtime CPU threads (default: 4)
+    REMAINDER_CHUNK_MODE character (default) or token (experimental token windows)
+    REMAINDER_RRF_K      Rank-fusion constant (default: 60; tested preset: 1)
+    REMAINDER_DENSE_WEIGHT Semantic rank weight (default: 1)
+    REMAINDER_MMR_PENALTY Diversity penalty (default: 0.006; tested preset: 0)
+    REMAINDER_QUERY_FOCUS lexical (default), 0 (unfiltered), or 1 (full query focus)
+    REMAINDER_MCP_SYNC_ROOT Optional folder to discover new files during MCP queries",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -862,6 +937,14 @@ ENVIRONMENT VARIABLES:
                 println!("  B-tree Integrity   : {}", if stats.integrity_ok { "PASS (ok)" } else { "FAIL" });
                 println!("  Tracked Sources    : {} total ({} current fresh)", stats.total_sources, stats.current_sources);
                 println!("  Atomic Facts       : {} total ({} active fresh)", stats.total_facts, stats.current_facts);
+                let passages: i64 = engine.conn.query_row("SELECT count(*) FROM source_chunks_fts", [], |row| row.get(0))?;
+                let vectors: i64 = engine.conn.query_row("SELECT count(*) FROM source_embeddings", [], |row| row.get(0))?;
+                println!("  Retrieval Mode     : {}", if engine.embedder.is_some() { "Hybrid (BM25 + local MiniLM)" } else { "BM25 only (MiniLM model unavailable)" });
+                println!("  Inference Backend  : {}", engine.embedder.as_ref().map(|model| model.backend_name()).unwrap_or("unavailable"));
+                println!("  Passage Vectors    : {} stored / {} indexed passages", vectors, passages);
+                if engine.embedder.is_none() {
+                    println!("  Model Setup        : Set REMAINDER_MODEL_DIR to a folder containing model.onnx and tokenizer.json");
+                }
                 if !stats.top_tags.is_empty() {
                     println!("\n  Top Category Tags  :");
                     for (tag, count) in &stats.top_tags {
@@ -887,6 +970,12 @@ ENVIRONMENT VARIABLES:
                     println!("[REPAIR] All checks passed. Bunker storage is pristine.");
                     return Ok(());
                 }
+            }
+            "reindex" => {
+                let count = engine.reindex_sources()?;
+                engine.checkpoint()?;
+                println!("[REINDEX] Rebuilt passage and embedding indexes for {} preserved sources.", count);
+                return Ok(());
             }
             "init" => {
                 let target_dir = if args.len() > 2 && !args[2].starts_with('-') {
@@ -927,6 +1016,7 @@ ENVIRONMENT VARIABLES:
                     .to_string();
                 let escaped_exe = current_exe.replace('\\', "\\\\");
                 let escaped_db = target_db.display().to_string().replace('\\', "\\\\");
+                let escaped_root = target_dir.display().to_string().replace('\\', "\\\\");
 
                 println!("\n  CONNECT TO YOUR AI TOOLS (MCP CONFIGURATION):");
                 println!("  ------------------------------------------------------------");
@@ -937,16 +1027,18 @@ ENVIRONMENT VARIABLES:
         "command": "{}",
         "args": ["mcp"],
         "env": {{
-          "REMAINDER_DB": "{}"
+          "REMAINDER_DB": "{}",
+          "REMAINDER_MCP_SYNC_ROOT": "{}"
         }}
       }}
     }}
-  }}"#, escaped_exe, escaped_db);
+  }}"#, escaped_exe, escaped_db, escaped_root);
 
                 println!("\n  For Cursor / Windsurf / VS Code (add in Settings -> MCP):");
                 println!("    Command : {}", current_exe);
                 println!("    Args    : mcp");
                 println!("    Env     : REMAINDER_DB={}", target_db.display());
+                println!("              REMAINDER_MCP_SYNC_ROOT={}", target_dir.display());
                 println!("============================================================");
                 println!("Bunker ready! Run 'remainder watch .' for background sync.");
                 return Ok(());
@@ -1018,11 +1110,10 @@ ENVIRONMENT VARIABLES:
                     println!("[BUNKER] No records found for query: {}", query);
                 } else {
                     for hit in hits {
-                        println!("[BUNKER] [{}] -> {}", hit.vault_tag, hit.fact_content);
+                        let (body, context) = rendered_hit_evidence(&hit);
+                        println!("[BUNKER] [{}] -> {}", hit.vault_tag, body);
                         println!("         Source: {}", hit.file_path);
-                        if let Some(ref exc) = hit.raw_excerpt {
-                            let single_line = exc.lines().collect::<Vec<_>>().join(" ");
-                            let preview: String = single_line.chars().take(1000).collect();
+                        if let Some(preview) = context {
                             println!("         Context: \"{}\"", preview);
                         }
                     }
@@ -1106,10 +1197,9 @@ ENVIRONMENT VARIABLES:
                     if !hits.is_empty() {
                         let combined = hits.iter()
                             .map(|h| {
-                                let mut s = format!("[{}] -> {}\n  Source: {}", h.vault_tag, h.fact_content, h.file_path);
-                                if let Some(ref exc) = h.raw_excerpt {
-                                    let single_line = exc.lines().collect::<Vec<_>>().join(" ");
-                                    let preview: String = single_line.chars().take(1000).collect();
+                                let (body, context) = rendered_hit_evidence(h);
+                                let mut s = format!("[{}] -> {}\n  Source: {}", h.vault_tag, body, h.file_path);
+                                if let Some(preview) = context {
                                     s.push_str(&format!("\n  Context: \"{}\"", preview));
                                 }
                                 s
@@ -1370,6 +1460,35 @@ ENVIRONMENT VARIABLES:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_deduplication_preserves_complete_passages_and_atomic_facts() {
+        let mut hit = engine::SearchHit {
+            vault_tag: "SOURCE".into(), fact_content: "important complete passage".into(),
+            file_path: "document.txt".into(), bm25_rank: 0.0,
+            raw_excerpt: Some("lead in important\ncomplete passage with surrounding evidence".into()),
+        };
+        let (body, extra) = search_hit_evidence(&hit, true);
+        assert!(body.contains("important complete passage"));
+        assert!(body.contains("surrounding evidence"));
+        assert!(extra.is_none());
+        hit.vault_tag = "DECISION".into();
+        let (body, extra) = search_hit_evidence(&hit, true);
+        assert_eq!(body, hit.fact_content);
+        assert!(extra.is_some());
+    }
+
+    #[test]
+    fn evidence_deduplication_retains_passage_when_excerpt_is_incomplete() {
+        let hit = engine::SearchHit {
+            vault_tag: "SOURCE".into(), fact_content: "important complete passage with critical conclusion".into(),
+            file_path: "document.txt".into(), bm25_rank: 0.0,
+            raw_excerpt: Some("lead in important complete passage ...".into()),
+        };
+        let (body, context) = search_hit_evidence(&hit, true);
+        assert!(body.contains("critical conclusion"));
+        assert!(context.is_some());
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1673,7 +1792,7 @@ mod tests {
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(resp["result"]["serverInfo"]["name"], "remainder-bunker");
-        assert_eq!(resp["result"]["serverInfo"]["version"], "0.4.0");
+        assert_eq!(resp["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
         Ok(())
     }
 
